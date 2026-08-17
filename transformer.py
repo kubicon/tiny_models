@@ -1,3 +1,5 @@
+import argparse
+
 import flax.linen as nn
 import jax.numpy as jnp
 import jax
@@ -90,7 +92,7 @@ class Normalization(nn.Module):
   def __call__(self, x, train: bool = False):
     if self.normalization == 'layer':
       return nn.LayerNorm()(x)
-    elif self.normalization == 'batch':
+    elif self.normalization == 'rms':
       return nn.RMSNorm()(x)
     elif self.normalization == 'none':
       return x
@@ -237,23 +239,42 @@ def generate_tokens(transformer, params, prompts: jnp.ndarray, n_tokens: int):
   return sequences[:, prompts.shape[1]:]
 
 
+def parse_args():
+  parser = argparse.ArgumentParser(description="Train a tiny transformer on integer addition.")
+  parser.add_argument('--vocab-size', type=int, default=13, help="10 digits, +, =, <EOS>. Do not use <PAD> if not necessary")
+  parser.add_argument('--sequence-length', type=int, default=10)
+  parser.add_argument('--batch-size', type=int, default=256)
+  parser.add_argument('--seed', type=int, default=0)
+  parser.add_argument('--d-model', type=int, default=28)
+  parser.add_argument('--n-heads', type=int, default=1)
+  parser.add_argument('--n-layers', type=int, default=1)
+  parser.add_argument('--hidden-dims', type=int, nargs='+', default=[16])
+  parser.add_argument('--dropout', type=float, default=0.1)
+  parser.add_argument('--use-bias', action='store_true', default=False)
+  parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'relu', 'swish', 'silu', 'mish', 'tanh', 'sigmoid', 'none'])
+  parser.add_argument('--normalization', type=str, default='layer', choices=['layer', 'rms', 'none'])
+  parser.add_argument('--num-steps', type=int, default=10000)
+  parser.add_argument('--num-samples', type=int, default=1000)
+  return parser.parse_args()
+
+
 def main():
-  vocab_size = 13 # 10 digits, +, =, <EOS>. Do not use <PAD> if not necessary
-  sequence_length = 10
-  batch_size = 256
-  seed = 0
-  d_model = 256
-  n_heads = 8
-  n_layers = 6
-  hidden_dims = (32, 32) 
-  dropout = 0.1
-  use_bias = True
-  normalization = 'layer'
-  num_steps = 10000
-  num_samples = 1000
-  
-  
-  
+  args = parse_args()
+  vocab_size = args.vocab_size
+  sequence_length = args.sequence_length
+  batch_size = args.batch_size
+  seed = args.seed
+  d_model = args.d_model
+  n_heads = args.n_heads
+  n_layers = args.n_layers
+  hidden_dims = tuple(args.hidden_dims)
+  dropout = args.dropout
+  use_bias = args.use_bias
+  activation = args.activation
+  normalization = args.normalization
+  num_steps = args.num_steps
+  num_samples = args.num_samples
+
   transformer = Transformer(
     n_heads=n_heads,
     d_model=d_model,
@@ -262,6 +283,7 @@ def main():
     n_layers=n_layers,
     vocab_size=vocab_size,
     hidden_dims=hidden_dims,
+    activation=activation,
     normalization=normalization,
     max_seq_len=episode_length(sequence_length),
   )
@@ -272,7 +294,7 @@ def main():
   rng_key, init_key = jax.random.split(rng_key)
   params = transformer.init(init_key, example_sequence, train=False)
   
-  optimizer = optax.adamw(learning_rate=1e-3, weight_decay=1e-2)
+  optimizer = optax.adamw(learning_rate=5e-3, weight_decay=1e-2)
   state = optimizer.init(params)
   
   @jax.jit
@@ -323,11 +345,11 @@ def main():
   for i in range(num_steps):
     rng_key, train_key = jax.random.split(rng_key)
     opt, loss = train_step(opt, train_key)
-    if i % 1000 == 0:
+    if i % 100 == 0:
       rng_key, val_key = jax.random.split(rng_key)
       results = validate(opt[0], val_key)
       print(f"Step {i+1}, Loss: {loss}")
-      print(f"Validation accuracy: {float(results['accuracy']) * 100:.2f}%")
+      print(f"Validation accuracy: {float(results['accuracy']) * 100:.2f}%", flush=True)
 
 
 if __name__ == "__main__":
