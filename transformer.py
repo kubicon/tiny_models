@@ -1,4 +1,6 @@
 import argparse
+import os
+import pickle
 
 import flax.linen as nn
 import jax.numpy as jnp
@@ -239,6 +241,18 @@ def generate_tokens(transformer, params, prompts: jnp.ndarray, n_tokens: int):
   return sequences[:, prompts.shape[1]:]
 
 
+def save_checkpoint(checkpoint_dir: str, step: int, params, opt_state, hparams: dict):
+  os.makedirs(checkpoint_dir, exist_ok=True)
+  checkpoint_path = os.path.join(checkpoint_dir, f"{step}.pkl")
+  with open(checkpoint_path, 'wb') as f:
+    pickle.dump({
+      'step': step,
+      'params': params,
+      'opt_state': opt_state,
+      'hparams': hparams,
+    }, f)
+
+
 def parse_args():
   parser = argparse.ArgumentParser(description="Train a tiny transformer on integer addition.")
   parser.add_argument('--vocab-size', type=int, default=13, help="10 digits, +, =, <EOS>. Do not use <PAD> if not necessary")
@@ -255,6 +269,8 @@ def parse_args():
   parser.add_argument('--normalization', type=str, default='layer', choices=['layer', 'rms', 'none'])
   parser.add_argument('--num-steps', type=int, default=100000)
   parser.add_argument('--num-samples', type=int, default=1000)
+  parser.add_argument('--checkpoint-dir', type=str, default=None, help="Folder to store checkpoints in. If not set, no checkpoints are saved.")
+  parser.add_argument('--checkpoint-every', type=int, default=1000, help="Save a checkpoint every N steps.")
   return parser.parse_args()
 
 
@@ -274,6 +290,24 @@ def main():
   normalization = args.normalization
   num_steps = args.num_steps
   num_samples = args.num_samples
+  checkpoint_dir = args.checkpoint_dir
+  checkpoint_every = args.checkpoint_every
+
+  hparams = {
+    'vocab_size': vocab_size,
+    'sequence_length': sequence_length,
+    'batch_size': batch_size,
+    'seed': seed,
+    'd_model': d_model,
+    'n_heads': n_heads,
+    'n_layers': n_layers,
+    'hidden_dims': hidden_dims,
+    'dropout': dropout,
+    'use_bias': use_bias,
+    'activation': activation,
+    'normalization': normalization,
+    'max_seq_len': episode_length(sequence_length),
+  }
 
   transformer = Transformer(
     n_heads=n_heads,
@@ -353,6 +387,12 @@ def main():
       results = validate(opt[0], val_key)
       print(f"Step {i+1}, Loss: {loss}")
       print(f"Validation accuracy: {float(results['accuracy']) * 100:.2f}%", flush=True)
+
+    if checkpoint_dir is not None and (i + 1) % checkpoint_every == 0:
+      save_checkpoint(checkpoint_dir, i + 1, opt[0], opt[1], hparams)
+
+  if checkpoint_dir is not None:
+    save_checkpoint(checkpoint_dir, num_steps, opt[0], opt[1], hparams)
 
 
 if __name__ == "__main__":
