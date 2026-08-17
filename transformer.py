@@ -245,15 +245,15 @@ def parse_args():
   parser.add_argument('--sequence-length', type=int, default=10)
   parser.add_argument('--batch-size', type=int, default=256)
   parser.add_argument('--seed', type=int, default=0)
-  parser.add_argument('--d-model', type=int, default=28)
-  parser.add_argument('--n-heads', type=int, default=1)
+  parser.add_argument('--d-model', type=int, default=32)
+  parser.add_argument('--n-heads', type=int, default=2)
   parser.add_argument('--n-layers', type=int, default=1)
-  parser.add_argument('--hidden-dims', type=int, nargs='+', default=[16])
+  parser.add_argument('--hidden-dims', type=int, nargs='+', default=[32])
   parser.add_argument('--dropout', type=float, default=0.1)
   parser.add_argument('--use-bias', action='store_true', default=False)
   parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'relu', 'swish', 'silu', 'mish', 'tanh', 'sigmoid', 'none'])
   parser.add_argument('--normalization', type=str, default='layer', choices=['layer', 'rms', 'none'])
-  parser.add_argument('--num-steps', type=int, default=10000)
+  parser.add_argument('--num-steps', type=int, default=100000)
   parser.add_argument('--num-samples', type=int, default=1000)
   return parser.parse_args()
 
@@ -293,7 +293,10 @@ def main():
   rng_key = jax.random.key(seed)
   rng_key, init_key = jax.random.split(rng_key)
   params = transformer.init(init_key, example_sequence, train=False)
-  
+
+  n_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
+  print(f"Trainable parameters: {n_params:,}")
+
   optimizer = optax.adamw(learning_rate=5e-3, weight_decay=1e-2)
   state = optimizer.init(params)
   
