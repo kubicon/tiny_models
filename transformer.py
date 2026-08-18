@@ -1,6 +1,7 @@
 import argparse
 import os
 import pickle
+from functools import partial
 
 import flax.linen as nn
 import jax.numpy as jnp
@@ -190,9 +191,15 @@ def episode_length(max_length: int) -> int:
   return max_length + 1 + max_length + 1 + (max_length + 1) + 1
 
 
-def generate_episode(max_length: int, batch_size: int, rng):
+def generate_episode(max_length: int, batch_size: int, rng, num_length: int = None):
+  """Same as before, but numbers are drawn with only `num_length` digits (default: max_length)
+  and zero-padded on the most-significant side up to max_length."""
 
-  input_numbers = sample_input_numbers(max_length, batch_size, rng)
+  if num_length is None:
+    num_length = max_length
+
+  input_numbers = sample_input_numbers(num_length, batch_size, rng)
+  input_numbers = jnp.pad(input_numbers, ((0, 0), (max_length - num_length, 0), (0, 0)))
 
   output_numbers = jax.vmap(generate_sum)(input_numbers)
   output_numbers = jnp.flip(output_numbers, axis=1)
@@ -253,26 +260,48 @@ def save_checkpoint(checkpoint_dir: str, step: int, params, opt_state, hparams: 
     }, f)
 
 
+def parse_num_length_schedule(schedule_args, default_length: int, default_steps: int):
+  """Parses ["SIZE:ITERS", ...] into [(size, iters), ...]. Any remaining steps (default_steps
+  minus the sum of the given ITERS) are appended as a final (default_length, remaining) entry,
+  so the schedule doesn't need to spell out the final default_length stage explicitly."""
+
+  schedule = []
+  for item in schedule_args:
+    size_str, iters_str = item.split(':')
+    schedule.append((int(size_str), int(iters_str)))
+
+  remaining_steps = default_steps - sum(iters for _, iters in schedule)
+  if remaining_steps > 0:
+    schedule.append((default_length, remaining_steps))
+
+  return schedule
+
+
 def parse_args():
   parser = argparse.ArgumentParser(description="Train a tiny transformer on integer addition.")
   parser.add_argument('--vocab-size', type=int, default=13, help="10 digits, +, =, <EOS>. Do not use <PAD> if not necessary")
   parser.add_argument('--sequence-length', type=int, default=10)
-  parser.add_argument('--batch-size', type=int, default=256)
-  parser.add_argument('--seed', type=int, default=0)
+  parser.add_argument('--batch-size', type=int, default=512)
+  parser.add_argument('--seed', type=int, default=2)
   parser.add_argument('--d-model', type=int, default=32)
-  parser.add_argument('--n-heads', type=int, default=2)
+  parser.add_argument('--n-heads', type=int, default=1)
   parser.add_argument('--n-layers', type=int, default=1)
   parser.add_argument('--hidden-dims', type=int, nargs='+', default=[32])
   parser.add_argument('--dropout', type=float, default=0.1)
   parser.add_argument('--use-bias', action='store_true', default=False)
   parser.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'relu', 'swish', 'silu', 'mish', 'tanh', 'sigmoid', 'none'])
-  parser.add_argument('--normalization', type=str, default='layer', choices=['layer', 'rms', 'none'])
+  parser.add_argument('--normalization', type=str, default='rms', choices=['layer', 'rms', 'none'])
   parser.add_argument('--num-steps', type=int, default=100000)
+  parser.add_argument('--learning-rate', type=float, default=2e-2)
+  parser.add_argument('--num-length-schedule', type=str, nargs='+', default=['4:2000', '7:5000'],
+                       help="List of SIZE:ITERS pairs, e.g. --num-length-schedule 2:1000 5:2000. "
+                            "Trains on `num_length=SIZE`-digit numbers (zero-padded to --sequence-length) for ITERS steps each, in order. "
+                            "Any steps left over after the schedule (--num-steps minus the sum of ITERS) are trained "
+                            "at --sequence-length.")
   parser.add_argument('--num-samples', type=int, default=1000)
   parser.add_argument('--checkpoint-dir', type=str, default=None, help="Folder to store checkpoints in. If not set, no checkpoints are saved.")
   parser.add_argument('--checkpoint-every', type=int, default=1000, help="Save a checkpoint every N steps.")
-  return parser.parse_args()
-
+  return parser.parse_args() 
 
 def main():
   args = parse_args()
@@ -289,6 +318,8 @@ def main():
   activation = args.activation
   normalization = args.normalization
   num_steps = args.num_steps
+  learning_rate = args.learning_rate
+  num_length_schedule = parse_num_length_schedule(args.num_length_schedule, sequence_length, num_steps)
   num_samples = args.num_samples
   checkpoint_dir = args.checkpoint_dir
   checkpoint_every = args.checkpoint_every
@@ -306,7 +337,9 @@ def main():
     'use_bias': use_bias,
     'activation': activation,
     'normalization': normalization,
+    'learning_rate': learning_rate,
     'max_seq_len': episode_length(sequence_length),
+    'num_length_schedule': num_length_schedule,
   }
 
   transformer = Transformer(
@@ -331,14 +364,14 @@ def main():
   n_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
   print(f"Trainable parameters: {n_params:,}")
 
-  optimizer = optax.adamw(learning_rate=5e-3, weight_decay=1e-2)
+  optimizer = optax.adamw(learning_rate=learning_rate, weight_decay=1e-2)
   state = optimizer.init(params)
   
-  @jax.jit
-  def train_step(opt, rng_key):
-    
+  @partial(jax.jit, static_argnames=('num_length',))
+  def train_step(opt, rng_key, num_length):
+
     episode_key, rng_key = jax.random.split(rng_key)
-    batch = generate_episode(sequence_length, batch_size, episode_key)
+    batch = generate_episode(sequence_length, batch_size, episode_key, num_length)
     params, state = opt
      
     def loss_fn(params, sequences, rng_key):
@@ -376,23 +409,27 @@ def main():
       'predicted_sum': digits_to_int(predicted_digits),
     }
 
-  rng_key = jax.random.key(seed)
   opt = (params, state)
 
-  for i in range(num_steps):
-    rng_key, train_key = jax.random.split(rng_key)
-    opt, loss = train_step(opt, train_key)
-    if i % 100 == 0:
-      rng_key, val_key = jax.random.split(rng_key)
-      results = validate(opt[0], val_key)
-      print(f"Step {i+1}, Loss: {loss}")
-      print(f"Validation accuracy: {float(results['accuracy']) * 100:.2f}%", flush=True)
+  i = 0
+  for num_length, iters in num_length_schedule:
+    print(f"Training on num_length={num_length} for {iters} steps", flush=True)
+    for _ in range(iters):
+      rng_key, train_key = jax.random.split(rng_key)
+      opt, loss = train_step(opt, train_key, num_length)
+      if i % 100 == 0:
+        rng_key, val_key = jax.random.split(rng_key)
+        results = validate(opt[0], val_key)
+        print(f"Step {i+1}, Loss: {loss}")
+        print(f"Validation accuracy: {float(results['accuracy']) * 100:.2f}%", flush=True)
 
-    if checkpoint_dir is not None and (i + 1) % checkpoint_every == 0:
-      save_checkpoint(checkpoint_dir, i + 1, opt[0], opt[1], hparams)
+      if checkpoint_dir is not None and (i + 1) % checkpoint_every == 0:
+        save_checkpoint(checkpoint_dir, i + 1, opt[0], opt[1], hparams)
+
+      i += 1
 
   if checkpoint_dir is not None:
-    save_checkpoint(checkpoint_dir, num_steps, opt[0], opt[1], hparams)
+    save_checkpoint(checkpoint_dir, i, opt[0], opt[1], hparams)
 
 
 if __name__ == "__main__":
