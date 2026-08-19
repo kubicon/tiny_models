@@ -51,7 +51,10 @@ class Attention(nn.Module):
     mask = jnp.tril(jnp.ones((seq_len, seq_len)))
     attention = jnp.where(mask[..., None] < 0.5, -jnp.inf, attention)
     attention = jax.nn.softmax(attention, axis=1)
-    
+    # (query_pos, key_pos, head) weights, opt-in via mutable=['intermediates'] on apply();
+    # a no-op otherwise, so it doesn't affect training.
+    self.sow('intermediates', 'attn_weights', attention)
+
     y = jnp.einsum('ijk,jkl->ikl', attention, v)
     y = y.reshape(seq_len, embed_dim)
     
@@ -321,17 +324,20 @@ def parse_args():
                        help="Arithmetic task to train on. The task owns its symbols, so the vocabulary "
                             "size follows from it (addition: 10 digits, +, =, <EOS> -> 13) and is not configurable.")
   parser.add_argument('--sequence-length', type=int, default=10)
-  parser.add_argument('--batch-size', type=int, default=256)
-  parser.add_argument('--seed', type=int, default=54)
-  parser.add_argument('--d-model', type=int, default=8)
+  parser.add_argument('--batch-size', type=int, default=512)
+  parser.add_argument('--seed', type=int, default=777)
+  parser.add_argument('--d-model', type=int, default=7)
   parser.add_argument('--n-heads', type=int, default=1)
   parser.add_argument('--n-layers', type=int, default=1)
-  parser.add_argument('--hidden-dims', type=int, nargs='+', default=[16])
+  parser.add_argument('--hidden-dims', type=int, nargs='+', default=[14])
   parser.add_argument('--use-bias', action='store_true', default=False)
   parser.add_argument('--activation', type=str, default='silu', choices=['gelu', 'relu', 'swish', 'silu', 'mish', 'tanh', 'sigmoid', 'none'])
   parser.add_argument('--normalization', type=str, default='rms', choices=['layer', 'rms', 'none'])
+  parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'muon'],
+                       help="Optimizer to use. 'muon' orthogonalizes updates for 2D params (Newton-schulz) "
+                            "and falls back to AdamW for the rest (embeddings, norms, biases).")
   parser.add_argument('--num-steps', type=int, default=50000)
-  parser.add_argument('--learning-rate', type=float, default=1.5e-2)
+  parser.add_argument('--learning-rate', type=float, default=2e-2)
   parser.add_argument('--num-length-schedule', type=str, nargs='+', default=["3:2000", "6:5000"],
                        help="List of SIZE:ITERS pairs, e.g. --num-length-schedule 2:1000 5:2000. "
                             "Trains on `num_length=SIZE`-digit numbers (zero-padded to --sequence-length) for ITERS steps each, in order. "
@@ -340,12 +346,14 @@ def parse_args():
   parser.add_argument('--lr-schedule', type=str, default='cosine', choices=['cosine', 'constant'],
                        help="Learning rate schedule. 'cosine' decays --learning-rate to --lr-min "
                             "over the whole run (after any warmup).")
-  parser.add_argument('--warmup-steps', type=int, default=2000,
+  parser.add_argument('--warmup-steps', type=int, default=1000,
                        help="Linear warmup from 0 to --learning-rate over this many steps, before the cosine decay.")
-  parser.add_argument('--lr-min', type=float, default=1.5e-3,
+  parser.add_argument('--lr-min', type=float, default=2e-3,
                        help="Absolute learning rate the cosine decays to at the final step.")
+  parser.add_argument('--grad-clip-norm', type=float, default=1.0,
+                       help="Clip gradients to this global norm before the optimizer update. Set to 0 to disable.")
   parser.add_argument('--num-samples', type=int, default=1000)
-  parser.add_argument('--checkpoint-dir', type=str, default="data/small_model", help="Folder to store checkpoints in. If not set, no checkpoints are saved.")
+  parser.add_argument('--checkpoint-dir', type=str, default="data/transformer_777", help="Folder to store checkpoints in. If not set, no checkpoints are saved.")
   parser.add_argument('--checkpoint-every', type=int, default=1000, help="Save a checkpoint every N steps.")
   parser.add_argument('--steps-per-chunk', type=int, default=250,
                        help="Number of training steps fused into a single jitted lax.scan call. Larger values "
@@ -372,6 +380,8 @@ def main():
   lr_schedule_name = args.lr_schedule
   warmup_steps = args.warmup_steps
   lr_min = args.lr_min
+  grad_clip_norm = args.grad_clip_norm
+  optimizer_name = args.optimizer
   num_length_schedule = parse_num_length_schedule(args.num_length_schedule, sequence_length, num_steps)
   # The curriculum is the authority on how many steps actually run (an explicit schedule may
   # overshoot --num-steps), so the LR decays over that horizon, not over --num-steps.
@@ -399,6 +409,8 @@ def main():
     'lr_schedule': lr_schedule_name,
     'warmup_steps': warmup_steps,
     'lr_min': lr_min,
+    'grad_clip_norm': grad_clip_norm,
+    'optimizer': optimizer_name,
     'total_steps': total_steps,
     'max_seq_len': task.episode_length(sequence_length),
     'num_length_schedule': num_length_schedule,
@@ -453,7 +465,12 @@ def main():
   else:
     lr_schedule = optax.constant_schedule(learning_rate)
 
-  optimizer = optax.adamw(learning_rate=lr_schedule, weight_decay=1e-2)
+  if optimizer_name == 'muon':
+    optimizer = optax.contrib.muon(learning_rate=lr_schedule, weight_decay=1e-2)
+  else:
+    optimizer = optax.adamw(learning_rate=lr_schedule, weight_decay=1e-2)
+  if grad_clip_norm > 0:
+    optimizer = optax.chain(optax.clip_by_global_norm(grad_clip_norm), optimizer)
   state = optimizer.init(params)
   
   # Static: the answer span always begins at the same offset, so the loss is a compile-time
@@ -480,9 +497,10 @@ def main():
       return losses.mean()
 
     loss, grads = jax.value_and_grad(loss_fn)(params, batch)
+    grad_norm = optax.global_norm(grads)
     updates, state = optimizer.update(grads, state, params)
     params = optax.apply_updates(params, updates)
-    return (params, state), loss
+    return (params, state), (loss, grad_norm)
 
   @partial(jax.jit, static_argnames=('num_length', 'n_steps'), donate_argnums=(0,))
   def train_chunk(opt, rng_key, num_length, n_steps):
@@ -491,8 +509,8 @@ def main():
     `opt` lets XLA update the params/optimizer buffers in place."""
 
     step_keys = jax.random.split(rng_key, n_steps)
-    opt, losses = jax.lax.scan(lambda o, k: train_step(o, k, num_length), opt, step_keys)
-    return opt, losses.mean()
+    opt, (losses, grad_norms) = jax.lax.scan(lambda o, k: train_step(o, k, num_length), opt, step_keys)
+    return opt, losses.mean(), grad_norms.mean()
 
   @jax.jit
   def validate(params, rng_key):
@@ -526,13 +544,13 @@ def main():
       # which costs one extra compilation for that stage.
       n_steps = min(steps_per_chunk, iters - steps_done)
       rng_key, train_key = jax.random.split(rng_key)
-      opt, loss = train_chunk(opt, train_key, num_length, n_steps)
+      opt, loss, grad_norm = train_chunk(opt, train_key, num_length, n_steps)
       steps_done += n_steps
       i += n_steps
 
       rng_key, val_key = jax.random.split(rng_key)
       results = validate(opt[0], val_key)
-      print(f"Step {i}, Loss (mean over last {n_steps} steps): {loss}, LR: {float(lr_schedule(i - 1)):.3e}")
+      print(f"Step {i}, Loss (mean over last {n_steps} steps): {loss}, Grad norm (mean over last {n_steps} steps, pre-clip): {grad_norm}, LR: {float(lr_schedule(i - 1)):.3e}")
       print(f"Validation accuracy: {float(results['accuracy']) * 100:.2f}%", flush=True)
 
       if checkpoint_dir is not None and i - last_checkpoint_step >= checkpoint_every:
