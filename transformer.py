@@ -136,11 +136,14 @@ class Transformer(nn.Module):
 
     seq_len = x.shape[0]
 
-    x = nn.Embed(self.vocab_size, self.d_model)(x)
+    # Held as a module rather than called inline so the same table can be reused as the output
+    # projection below (tied embeddings, as in the 777-parameter reference).
+    tok_embed = nn.Embed(self.vocab_size, self.d_model, name='tok_embed')
+    x = tok_embed(x)
 
     # Fixed-size table sliced to seq_len, so params stay valid across calls with different lengths
     # (needed for autoregressive generation, which calls the model on growing prefixes).
-    pos_embed = nn.Embed(self.max_seq_len, self.d_model)(jnp.arange(seq_len, dtype=jnp.int32))
+    pos_embed = nn.Embed(self.max_seq_len, self.d_model, name='pos_embed')(jnp.arange(seq_len, dtype=jnp.int32))
     
     x = x + pos_embed
     
@@ -157,8 +160,10 @@ class Transformer(nn.Module):
       x = x + residual
       
     x = Normalization(self.normalization)(x, train=train)
-    x = nn.Dense(self.vocab_size, use_bias=self.use_bias, name='out_proj')(x) 
-    
+    # Tied output projection: logits = x @ tok_embed.embedding.T, with no separate decoder matrix
+    # and no output bias. Saves vocab_size * d_model params and is what the reference does.
+    x = tok_embed.attend(x)
+
     return x
 
 
@@ -232,15 +237,30 @@ def pad_numbers(numbers: jnp.ndarray, max_length: int):
 def generate_prompts(task: Task, max_length: int, batch_size: int, rng, num_length: int = None):
   """Samples an operand pair per row and renders the prompt 'N1 op N2 ='.
 
-  Numbers are drawn with only `num_length` digits (default: max_length) and zero-padded on the
-  most-significant side up to max_length. Returns the prompts, the operand digits and the
-  MSB-first answer digits, so both the training and the validation builders share one layout."""
+  When `num_length` is given, each row independently draws its operand size uniformly from
+  1..num_length; otherwise every row uses the full `max_length`. Operands are always rendered
+  zero-padded on the most-significant side to `max_length`, so the token layout is identical
+  whatever size a row drew.
 
-  if num_length is None:
-    num_length = max_length
+  Mixing sizes within the batch (rather than pinning a whole curriculum stage to one size) is what
+  the 777-parameter reference does: its phases are (1, 3), (1, 6), (1, 10), so even the final phase
+  keeps short problems in the mix. Training on a single size instead leaves the model with no
+  gradient on the digit positions that stage never populates.
 
-  input_numbers = task.sample_inputs(num_length, batch_size, rng)
-  input_numbers = jnp.pad(input_numbers, ((0, 0), (max_length - num_length, 0), (0, 0)))
+  Rows are drawn at max_length and the unused leading digits are then zeroed, which is the same
+  distribution as drawing n digits and padding, but keeps the shape static under jit.
+
+  Returns the prompts, the operand digits and the MSB-first answer digits, so both the training
+  and the validation builders share one layout."""
+
+  rng, size_rng = jax.random.split(rng)
+  input_numbers = task.sample_inputs(max_length, batch_size, rng)
+
+  if num_length is not None:
+    n_digits = jax.random.randint(size_rng, (batch_size,), 1, num_length + 1)
+    # Keep the n_digits least-significant positions of each row, zero the leading ones.
+    used = jnp.arange(max_length)[None, :] >= (max_length - n_digits)[:, None]
+    input_numbers = jnp.where(used[..., None], input_numbers, 0)
 
   answer_digits = jax.vmap(task.compute)(input_numbers)
 
@@ -302,7 +322,7 @@ def save_checkpoint(checkpoint_dir: str, step: int, params, opt_state, hparams: 
 
 
 def parse_num_length_schedule(schedule_args, default_length: int, default_steps: int):
-  """Parses ["SIZE:ITERS", ...] into [(size, iters), ...]. Any remaining steps (default_steps
+  """Parses ["MAXSIZE:ITERS", ...] into [(max_size, iters), ...]. Any remaining steps (default_steps
   minus the sum of the given ITERS) are appended as a final (default_length, remaining) entry,
   so the schedule doesn't need to spell out the final default_length stage explicitly."""
 
@@ -325,24 +345,28 @@ def parse_args():
                             "size follows from it (addition: 10 digits, +, =, <EOS> -> 13) and is not configurable.")
   parser.add_argument('--sequence-length', type=int, default=10)
   parser.add_argument('--batch-size', type=int, default=512)
-  parser.add_argument('--seed', type=int, default=777)
+  parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--d-model', type=int, default=7)
   parser.add_argument('--n-heads', type=int, default=1)
   parser.add_argument('--n-layers', type=int, default=1)
-  parser.add_argument('--hidden-dims', type=int, nargs='+', default=[14])
+  parser.add_argument('--hidden-dims', type=int, nargs='+', default=[8])
   parser.add_argument('--use-bias', action='store_true', default=False)
   parser.add_argument('--activation', type=str, default='silu', choices=['gelu', 'relu', 'swish', 'silu', 'mish', 'tanh', 'sigmoid', 'none'])
   parser.add_argument('--normalization', type=str, default='rms', choices=['layer', 'rms', 'none'])
   parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'muon'],
                        help="Optimizer to use. 'muon' orthogonalizes updates for 2D params (Newton-schulz) "
                             "and falls back to AdamW for the rest (embeddings, norms, biases).")
-  parser.add_argument('--num-steps', type=int, default=50000)
+  parser.add_argument('--num-steps', type=int, default=27000,
+                       help="Total training steps. The default matches the 777-parameter reference's "
+                            "2000 + 5000 + 20000 curriculum.")
   parser.add_argument('--learning-rate', type=float, default=2e-2)
   parser.add_argument('--num-length-schedule', type=str, nargs='+', default=["3:2000", "6:5000"],
-                       help="List of SIZE:ITERS pairs, e.g. --num-length-schedule 2:1000 5:2000. "
-                            "Trains on `num_length=SIZE`-digit numbers (zero-padded to --sequence-length) for ITERS steps each, in order. "
-                            "Any steps left over after the schedule (--num-steps minus the sum of ITERS) are trained "
-                            "at --sequence-length.")
+                       help="Curriculum, as a list of MAXSIZE:ITERS pairs, e.g. --num-length-schedule 3:2000 6:5000. "
+                            "For ITERS steps, each example independently draws its operand size uniformly from "
+                            "1..MAXSIZE (zero-padded to --sequence-length), so every phase mixes sizes rather than "
+                            "pinning the whole phase to one. Any steps left over after the schedule (--num-steps "
+                            "minus the sum of ITERS) draw from 1..--sequence-length. The default reproduces the "
+                            "777-parameter reference's phases: (1,3) x 2000, (1,6) x 5000, (1,10) x the rest.")
   parser.add_argument('--lr-schedule', type=str, default='cosine', choices=['cosine', 'constant'],
                        help="Learning rate schedule. 'cosine' decays --learning-rate to --lr-min "
                             "over the whole run (after any warmup).")
@@ -468,7 +492,7 @@ def main():
   if optimizer_name == 'muon':
     optimizer = optax.contrib.muon(learning_rate=lr_schedule, weight_decay=1e-2)
   else:
-    optimizer = optax.adamw(learning_rate=lr_schedule, weight_decay=1e-2)
+    optimizer = optax.adamw(learning_rate=lr_schedule,  weight_decay=1e-2)
   if grad_clip_norm > 0:
     optimizer = optax.chain(optax.clip_by_global_norm(grad_clip_norm), optimizer)
   state = optimizer.init(params)
