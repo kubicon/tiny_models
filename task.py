@@ -8,7 +8,13 @@ class Task:
   The token layout is shared by every task: 0-9 are digits, followed by the task's operator,
   '=' and <EOS>, so `vocab_size` follows from the tokens rather than being configured.
   Subclasses supply the operator's meaning via `compute` and, where the task needs it, a
-  different operand distribution via `sample_inputs`."""
+  different operand distribution via `sample_inputs`.
+
+  The two operands are independent axes throughout: `max_length1`/`max_length2` are the
+  rendered (zero-padded) digit widths of the first/second operand, and generation additionally
+  accepts per-call `num_length1`/`num_length2` curriculum caps. A task whose second operand
+  should always be short (e.g. a single digit) just gets a small `max_length2` at the call
+  site -- there's no need for a dedicated subclass."""
 
   name = 'task'
   op_token = 10
@@ -19,69 +25,79 @@ class Task:
   def vocab_size(self) -> int:
     return self.eos_token + 1
 
-  def answer_length(self, max_length: int) -> int:
-    """Number of answer digits produced for two `max_length`-digit operands."""
+  def answer_length(self, max_length1: int, max_length2: int) -> int:
+    """Number of answer digits produced for a `max_length1`-digit and `max_length2`-digit operand."""
     raise NotImplementedError
 
-  def compute(self, numbers: jnp.ndarray) -> jnp.ndarray:
-    """(max_length, 2) MSB-first digit pairs -> the answer's digits, MSB-first."""
+  def compute(self, a_digits: jnp.ndarray, b_digits: jnp.ndarray) -> jnp.ndarray:
+    """MSB-first digits of the two operands -> the answer's digits, MSB-first."""
     raise NotImplementedError
 
-  def sample_inputs(self, num_length: int, batch_size: int, rng) -> jnp.ndarray:
-    return jax.random.randint(rng, (batch_size, num_length, 2), 0, 10)
+  def sample_inputs(self, max_length1: int, max_length2: int, batch_size: int, rng):
+    rng1, rng2 = jax.random.split(rng)
+    a = jax.random.randint(rng1, (batch_size, max_length1), 0, 10)
+    b = jax.random.randint(rng2, (batch_size, max_length2), 0, 10)
+    return a, b
 
-  def episode_length(self, max_length: int) -> int:
+  def episode_length(self, max_length1: int, max_length2: int) -> int:
     """Total token length of a generate_episode sequence: N1, op, N2, '=', answer digits, <EOS>."""
-    return max_length + 1 + max_length + 1 + self.answer_length(max_length) + 1
+    return max_length1 + 1 + max_length2 + 1 + self.answer_length(max_length1, max_length2) + 1
 
-  def answer_start_index(self, max_length: int) -> int:
+  def answer_start_index(self, max_length1: int, max_length2: int) -> int:
     """Index of the '=' token in a generate_episode sequence.
 
-    Layout: N1 [0, L), op [L], N2 [L+1, 2L], '=' [2L+1], answer digits, <EOS>.
+    Layout: N1 [0, L1), op [L1], N2 [L1+1, L1+1+L2), '=' [L1+1+L2], answer digits, <EOS>.
     In a next-token loss, position i predicts token i+1, so slicing logits from this index gives
     exactly the answer targets (the answer digits and <EOS>) and drops the prompt positions,
     whose targets are uniform random digits and carry no learnable signal."""
-    return 2 * max_length + 1
+    return max_length1 + 1 + max_length2
 
 
 class AdditionTask(Task):
   name = 'add'
 
-  def answer_length(self, max_length: int) -> int:
-    return max_length + 1
+  def answer_length(self, max_length1: int, max_length2: int) -> int:
+    return max(max_length1, max_length2) + 1
 
-  def compute(self, numbers: jnp.ndarray) -> jnp.ndarray:
-    def add_digits(carry, x):
-      result = x[0] + x[1] + carry
+  def compute(self, a_digits: jnp.ndarray, b_digits: jnp.ndarray) -> jnp.ndarray:
+    length = max(a_digits.shape[0], b_digits.shape[0])
+    a_digits = jnp.pad(a_digits, (length - a_digits.shape[0], 0))
+    b_digits = jnp.pad(b_digits, (length - b_digits.shape[0], 0))
+
+    def add_digits(carry, xy):
+      x, y = xy
+      result = x + y + carry
       carry = result // 10
       result = result % 10
       return carry, result
 
-    carry, digits = jax.lax.scan(add_digits, 0, numbers, reverse=True)
+    carry, digits = jax.lax.scan(add_digits, 0, (a_digits, b_digits), reverse=True)
     return jnp.concatenate((carry[None], digits))
 
 
 class MultiplicationTask(Task):
   name = 'multiply'
 
-  def answer_length(self, max_length: int) -> int:
-    # Two max_length-digit operands multiply to at most 2 * max_length digits.
-    return 2 * max_length
+  def answer_length(self, max_length1: int, max_length2: int) -> int:
+    # An L1-digit and L2-digit operand multiply to at most L1 + L2 digits.
+    return max_length1 + max_length2
 
-  def compute(self, numbers: jnp.ndarray) -> jnp.ndarray:
-    a_lsb = jnp.flip(numbers[:, 0])
-    b_lsb = jnp.flip(numbers[:, 1])
-    max_length = numbers.shape[0]
+  def compute(self, a_digits: jnp.ndarray, b_digits: jnp.ndarray) -> jnp.ndarray:
+    a_lsb = jnp.flip(a_digits)
+    b_lsb = jnp.flip(b_digits)
+    length1 = a_digits.shape[0]
+    length2 = b_digits.shape[0]
 
     # Schoolbook multiplication: for each output place k, sum every digit pair (i, j) with
-    # i + j = k. max_length is static (it's an array shape), so this unrolls into a small,
+    # i + j = k. length1/length2 are static (they're array shapes), so this unrolls into a small,
     # fixed graph of elementwise multiplies/adds -- deliberately avoiding jnp.convolve, which
     # lowers to XLA's conv primitive and pulls in a cuDNN dependency this tiny sum doesn't need.
-    # Each place's sum is at most max_length * 81, well within range before carry propagation.
+    # Each place's sum is at most min(length1, length2) * 81, well within range before carry
+    # propagation.
     products = jnp.stack([
       sum(a_lsb[i] * b_lsb[k - i]
-          for i in range(max(0, k - max_length + 1), min(k, max_length - 1) + 1))
-      for k in range(2 * max_length - 1)
+          for i in range(max(0, k - length2 + 1), min(k, length1 - 1) + 1))
+      for k in range(length1 + length2 - 1)
     ])
 
     def carry_digit(carry, x):
@@ -91,8 +107,8 @@ class MultiplicationTask(Task):
       return carry, digit
 
     final_carry, digits_lsb = jax.lax.scan(carry_digit, 0, products)
-    # products has 2 * max_length - 1 places; the final carry supplies the top digit,
-    # exactly filling answer_length's 2 * max_length digits.
+    # products has length1 + length2 - 1 places; the final carry supplies the top digit,
+    # exactly filling answer_length's length1 + length2 digits.
     digits_lsb = jnp.concatenate((digits_lsb, final_carry[None]))
     return jnp.flip(digits_lsb)
 
@@ -100,64 +116,68 @@ class MultiplicationTask(Task):
 TASKS = {task.name: task for task in (AdditionTask, MultiplicationTask)}
 
 
-def pad_numbers(numbers: jnp.ndarray, max_length: int):
-
-  return jnp.pad(numbers, (max_length - numbers.shape[0], 0))
-
-
-def generate_prompts(task: Task, max_length: int, batch_size: int, rng, num_length: int = None):
+def generate_prompts(
+    task: Task, max_length1: int, max_length2: int, batch_size: int, rng,
+    num_length1: int = None, num_length2: int = None):
   """Samples an operand pair per row and renders the prompt 'N1 op N2 ='.
 
-  When `num_length` is given, each row independently draws its operand size uniformly from
-  1..num_length; otherwise every row uses the full `max_length`. Operands are always rendered
-  zero-padded on the most-significant side to `max_length`, so the token layout is identical
-  whatever size a row drew.
+  When `num_length1` (resp. `num_length2`) is given, each row independently draws that operand's
+  size uniformly from 1..num_length1 (resp. num_length2); otherwise the operand always uses its
+  full rendered width. Operands are always rendered zero-padded on the most-significant side to
+  their rendered width (`max_length1` for N1, `max_length2` for N2), so the token layout is
+  identical whatever size a row drew.
 
   Mixing sizes within the batch (rather than pinning a whole curriculum stage to one size) is what
   the 777-parameter reference does: its phases are (1, 3), (1, 6), (1, 10), so even the final phase
   keeps short problems in the mix. Training on a single size instead leaves the model with no
   gradient on the digit positions that stage never populates.
 
-  Rows are drawn at max_length and the unused leading digits are then zeroed, which is the same
-  distribution as drawing n digits and padding, but keeps the shape static under jit.
+  Rows are drawn at the full rendered width and the unused leading digits are then zeroed, which
+  is the same distribution as drawing n digits and padding, but keeps the shape static under jit.
 
-  Returns the prompts, the operand digits and the MSB-first answer digits, so both the training
-  and the validation builders share one layout."""
+  Returns the prompts, the (a, b) operand digits and the MSB-first answer digits, so both the
+  training and the validation builders share one layout."""
 
-  rng, size_rng = jax.random.split(rng)
-  input_numbers = task.sample_inputs(max_length, batch_size, rng)
+  rng, size_rng1, size_rng2 = jax.random.split(rng, 3)
+  a, b = task.sample_inputs(max_length1, max_length2, batch_size, rng)
 
-  if num_length is not None:
-    n_digits = jax.random.randint(size_rng, (batch_size,), 1, num_length + 1)
-    # Keep the n_digits least-significant positions of each row, zero the leading ones.
-    used = jnp.arange(max_length)[None, :] >= (max_length - n_digits)[:, None]
-    input_numbers = jnp.where(used[..., None], input_numbers, 0)
+  if num_length1 is not None:
+    n1 = jax.random.randint(size_rng1, (batch_size,), 1, num_length1 + 1)
+    used1 = jnp.arange(max_length1)[None, :] >= (max_length1 - n1)[:, None]
+    a = jnp.where(used1, a, 0)
+  if num_length2 is not None:
+    n2 = jax.random.randint(size_rng2, (batch_size,), 1, num_length2 + 1)
+    used2 = jnp.arange(max_length2)[None, :] >= (max_length2 - n2)[:, None]
+    b = jnp.where(used2, b, 0)
 
-  answer_digits = jax.vmap(task.compute)(input_numbers)
+  answer_digits = jax.vmap(task.compute)(a, b)
 
   op_tokens = jnp.full((batch_size, 1), task.op_token)
   eq_tokens = jnp.full((batch_size, 1), task.eq_token)
 
-  prompts = jnp.concatenate((input_numbers[..., 0], op_tokens, input_numbers[..., 1], eq_tokens), axis=-1)
+  prompts = jnp.concatenate((a, op_tokens, b, eq_tokens), axis=-1)
 
-  return prompts, input_numbers, answer_digits
+  return prompts, (a, b), answer_digits
 
 
-def generate_episode(task: Task, max_length: int, batch_size: int, rng, num_length: int = None):
+def generate_episode(
+    task: Task, max_length1: int, max_length2: int, batch_size: int, rng,
+    num_length1: int = None, num_length2: int = None):
   """A full training sequence: the prompt, then the answer emitted LSB-first, then <EOS>."""
 
-  prompts, _, answer_digits = generate_prompts(task, max_length, batch_size, rng, num_length)
+  prompts, _, answer_digits = generate_prompts(
+    task, max_length1, max_length2, batch_size, rng, num_length1, num_length2)
   eos_tokens = jnp.full((batch_size, 1), task.eos_token)
 
   return jnp.concatenate((prompts, jnp.flip(answer_digits, axis=-1), eos_tokens), axis=-1)
 
 
-def generate_validation_prompts(task: Task, max_length: int, batch_size: int, rng):
+def generate_validation_prompts(task: Task, max_length1: int, max_length2: int, batch_size: int, rng):
   """Same sampling as generate_episode, but stops after '=' (no target digits)."""
 
-  prompts, input_numbers, answer_digits = generate_prompts(task, max_length, batch_size, rng)
+  prompts, operands, answer_digits = generate_prompts(task, max_length1, max_length2, batch_size, rng)
 
-  return prompts, answer_digits, input_numbers
+  return prompts, answer_digits, operands
 
 
 def digits_to_int(digits: jnp.ndarray, msb_first: bool = True):
