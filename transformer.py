@@ -195,18 +195,27 @@ def save_checkpoint(checkpoint_dir: str, step: int, params, opt_state, hparams: 
 
 
 def parse_num_length_schedule(schedule_args, default_length: int, default_steps: int):
-  """Parses ["MAXSIZE:ITERS", ...] into [(max_size, iters), ...]. Any remaining steps (default_steps
-  minus the sum of the given ITERS) are appended as a final (default_length, remaining) entry,
-  so the schedule doesn't need to spell out the final default_length stage explicitly."""
+  """Parses ["N1:N2:ITERS", ...] into [(n1, n2, iters), ...]. "N:ITERS" is shorthand for
+  "N:N:ITERS" (same max size for both operands). Any remaining steps (default_steps minus the
+  sum of the given ITERS) are appended as a final (default_length, default_length, remaining)
+  entry, so the schedule doesn't need to spell out the final stage explicitly."""
 
   schedule = []
   for item in schedule_args:
-    size_str, iters_str = item.split(':')
-    schedule.append((int(size_str), int(iters_str)))
+    parts = item.split(':')
+    if len(parts) == 2:
+      size_str, iters_str = parts
+      n1 = n2 = int(size_str)
+    elif len(parts) == 3:
+      n1_str, n2_str, iters_str = parts
+      n1, n2 = int(n1_str), int(n2_str)
+    else:
+      raise ValueError(f"Invalid --num-length-schedule entry {item!r}, expected N:ITERS or N1:N2:ITERS")
+    schedule.append((n1, n2, int(iters_str)))
 
-  remaining_steps = default_steps - sum(iters for _, iters in schedule)
+  remaining_steps = default_steps - sum(iters for _, _, iters in schedule)
   if remaining_steps > 0:
-    schedule.append((default_length, remaining_steps))
+    schedule.append((default_length, default_length, remaining_steps))
 
   return schedule
 
@@ -233,13 +242,15 @@ def parse_args():
                        help="Total training steps. The default matches the 777-parameter reference's "
                             "2000 + 5000 + 20000 curriculum.")
   parser.add_argument('--learning-rate', type=float, default=2e-2)
-  parser.add_argument('--num-length-schedule', type=str, nargs='+', default=["3:2000", "6:5000"],
-                       help="Curriculum, as a list of MAXSIZE:ITERS pairs, e.g. --num-length-schedule 3:2000 6:5000. "
-                            "For ITERS steps, each example independently draws its operand size uniformly from "
-                            "1..MAXSIZE (zero-padded to --sequence-length), so every phase mixes sizes rather than "
-                            "pinning the whole phase to one. Any steps left over after the schedule (--num-steps "
-                            "minus the sum of ITERS) draw from 1..--sequence-length. The default reproduces the "
-                            "777-parameter reference's phases: (1,3) x 2000, (1,6) x 5000, (1,10) x the rest.")
+  parser.add_argument('--num-length-schedule', type=str, nargs='+', default=["3:2000", "6:5000", "9:20000"],
+                       help="Curriculum, as a list of N1:N2:ITERS triples (or N:ITERS as shorthand for "
+                            "N:N:ITERS), e.g. --num-length-schedule 3:2000 6:1:5000. For ITERS steps, each "
+                            "example independently draws its first operand's size uniformly from 1..N1 and "
+                            "its second operand's size from 1..N2 (both zero-padded to --sequence-length), "
+                            "so every phase mixes sizes rather than pinning the whole phase to one. Any steps "
+                            "left over after the schedule (--num-steps minus the sum of ITERS) draw from "
+                            "1..--sequence-length for both operands. The default reproduces the 777-parameter "
+                            "reference's phases: (1,3) x 2000, (1,6) x 5000, (1,10) x the rest.")
   parser.add_argument('--lr-schedule', type=str, default='cosine', choices=['cosine', 'constant'],
                        help="Learning rate schedule. 'cosine' decays --learning-rate to --lr-min "
                             "over the whole run (after any warmup).")
@@ -279,10 +290,11 @@ def main():
   lr_min = args.lr_min
   grad_clip_norm = args.grad_clip_norm
   optimizer_name = args.optimizer
-  num_length_schedule = parse_num_length_schedule(args.num_length_schedule, sequence_length, num_steps)
+  num_length_schedule = parse_num_length_schedule(
+    args.num_length_schedule, sequence_length, num_steps)
   # The curriculum is the authority on how many steps actually run (an explicit schedule may
   # overshoot --num-steps), so the LR decays over that horizon, not over --num-steps.
-  total_steps = sum(iters for _, iters in num_length_schedule)
+  total_steps = sum(iters for _, _, iters in num_length_schedule)
   num_samples = args.num_samples
   checkpoint_dir = args.checkpoint_dir
   checkpoint_every = args.checkpoint_every
@@ -309,7 +321,7 @@ def main():
     'grad_clip_norm': grad_clip_norm,
     'optimizer': optimizer_name,
     'total_steps': total_steps,
-    'max_seq_len': task.episode_length(sequence_length),
+    'max_seq_len': task.episode_length(sequence_length, sequence_length),
     'num_length_schedule': num_length_schedule,
     'steps_per_chunk': steps_per_chunk,
   }
@@ -323,12 +335,12 @@ def main():
     hidden_dims=hidden_dims,
     activation=activation,
     normalization=normalization,
-    max_seq_len=task.episode_length(sequence_length),
+    max_seq_len=task.episode_length(sequence_length, sequence_length),
   )
-  
-  
-  example_sequence = generate_episode(task, sequence_length, 1, jax.random.key(seed))[0]
+
   rng_key = jax.random.key(seed)
+  rng_key, example_key = jax.random.split(rng_key)
+  example_sequence = generate_episode(task, sequence_length, sequence_length, 1, example_key)[0]
   rng_key, init_key = jax.random.split(rng_key)
   params = transformer.init(init_key, example_sequence, train=False)
 
@@ -372,13 +384,14 @@ def main():
   
   # Static: the answer span always begins at the same offset, so the loss is a compile-time
   # slice rather than a runtime mask.
-  answer_start = task.answer_start_index(sequence_length)
+  answer_start = task.answer_start_index(sequence_length, sequence_length)
 
-  def train_step(opt, rng_key, num_length):
+  def train_step(opt, rng_key, num_length1, num_length2):
     """One optimizer step. Written as a lax.scan body (carry -> (carry, y)) so a whole chunk
     of steps can be fused into a single dispatch by train_chunk."""
 
-    batch = generate_episode(task, sequence_length, batch_size, rng_key, num_length)
+    batch = generate_episode(
+      task, sequence_length, sequence_length, batch_size, rng_key, num_length1, num_length2)
     params, state = opt
 
     def loss_fn(params, sequences):
@@ -399,21 +412,23 @@ def main():
     params = optax.apply_updates(params, updates)
     return (params, state), (loss, grad_norm)
 
-  @partial(jax.jit, static_argnames=('num_length', 'n_steps'), donate_argnums=(0,))
-  def train_chunk(opt, rng_key, num_length, n_steps):
+  @partial(jax.jit, static_argnames=('num_length1', 'num_length2', 'n_steps'), donate_argnums=(0,))
+  def train_chunk(opt, rng_key, num_length1, num_length2, n_steps):
     """Runs n_steps training steps inside one jitted lax.scan. At this model size the per-step
     kernels are tiny, so fusing steps keeps the accelerator from being dispatch-bound; donating
     `opt` lets XLA update the params/optimizer buffers in place."""
 
     step_keys = jax.random.split(rng_key, n_steps)
-    opt, (losses, grad_norms) = jax.lax.scan(lambda o, k: train_step(o, k, num_length), opt, step_keys)
+    opt, (losses, grad_norms) = jax.lax.scan(
+      lambda o, k: train_step(o, k, num_length1, num_length2), opt, step_keys)
     return opt, losses.mean(), grad_norms.mean()
 
   @jax.jit
   def validate(params, rng_key):
-    prompts, target_digits, input_numbers = generate_validation_prompts(task, sequence_length, num_samples, rng_key)
+    prompts, target_digits, (a, b) = generate_validation_prompts(
+      task, sequence_length, sequence_length, num_samples, rng_key)
 
-    n_output_digits = task.answer_length(sequence_length)
+    n_output_digits = task.answer_length(sequence_length, sequence_length)
     generated_digits = generate_tokens(transformer, params, prompts, n_output_digits)
     # The model was trained to emit the answer reversed (LSB-first); flip back to compare digit-for-digit.
     predicted_digits = jnp.flip(generated_digits, axis=-1)
@@ -423,8 +438,8 @@ def main():
     return {
       'accuracy': jnp.mean(correct),
       'correct': correct,
-      'n1': digits_to_int(input_numbers[..., 0]),
-      'n2': digits_to_int(input_numbers[..., 1]),
+      'n1': digits_to_int(a),
+      'n2': digits_to_int(b),
       'target_answer': digits_to_int(target_digits),
       'predicted_answer': digits_to_int(predicted_digits),
     }
@@ -433,15 +448,15 @@ def main():
 
   i = 0
   last_checkpoint_step = 0
-  for num_length, iters in num_length_schedule:
-    print(f"Training on num_length={num_length} for {iters} steps", flush=True)
+  for num_length1, num_length2, iters in num_length_schedule:
+    print(f"Training on num_length1={num_length1}, num_length2={num_length2} for {iters} steps", flush=True)
     steps_done = 0
     while steps_done < iters:
       # A stage whose length is not a multiple of steps_per_chunk ends with one shorter chunk,
       # which costs one extra compilation for that stage.
       n_steps = min(steps_per_chunk, iters - steps_done)
       rng_key, train_key = jax.random.split(rng_key)
-      opt, loss, grad_norm = train_chunk(opt, train_key, num_length, n_steps)
+      opt, loss, grad_norm = train_chunk(opt, train_key, num_length1, num_length2, n_steps)
       steps_done += n_steps
       i += n_steps
 
