@@ -13,11 +13,40 @@ import optax
 from task import TASKS, generate_episode, generate_validation_prompts, digits_to_int
 
 
+def apply_rope(x, base: float = 10000.0):
+  """Rotary positional embedding for a (seq_len, n_heads, head_dim) tensor.
+
+  Rotates consecutive channel pairs by an angle proportional to the position, so attention
+  logits depend on relative distance only. If head_dim is odd (this model runs d_model=7 with
+  one head), the trailing channel has no partner and is passed through unrotated."""
+
+  seq_len, n_heads, head_dim = x.shape
+  n_pairs = head_dim // 2
+  if n_pairs == 0:
+    return x
+
+  positions = jnp.arange(seq_len, dtype=x.dtype)
+  inv_freq = base ** (-jnp.arange(n_pairs, dtype=x.dtype) / n_pairs)
+  angles = positions[:, None] * inv_freq[None, :]          # (seq_len, n_pairs)
+  cos = jnp.cos(angles)[:, None, :]
+  sin = jnp.sin(angles)[:, None, :]
+
+  pairs = x[..., :2 * n_pairs].reshape(seq_len, n_heads, n_pairs, 2)
+  even, odd = pairs[..., 0], pairs[..., 1]
+  out = jnp.stack((even * cos - odd * sin, even * sin + odd * cos), axis=-1)
+  out = out.reshape(seq_len, n_heads, 2 * n_pairs)
+
+  # Odd head_dim: the leftover channel has no partner, so it passes through unrotated.
+  return jnp.concatenate((out, x[..., 2 * n_pairs:]), axis=-1)
+
+
 class Attention(nn.Module): 
   
   n_heads: int = 8 
   d_model: int = 512
   use_bias: bool = True
+  pos_embed: str = 'learned'
+  rope_base: float = 10000.0
   
   
   @nn.compact
@@ -45,7 +74,11 @@ class Attention(nn.Module):
     q = q.reshape(seq_len, self.n_heads, head_dim)
     k = k.reshape(seq_len, self.n_heads, head_dim)
     v = v.reshape(seq_len, self.n_heads, head_dim)
-    
+
+    if self.pos_embed == 'rope':
+      q = apply_rope(q, self.rope_base)
+      k = apply_rope(k, self.rope_base)
+
     attention = jnp.einsum('ijk,ljk->ilj', q, k)
     attention = attention / jnp.sqrt(head_dim)
 
@@ -131,6 +164,8 @@ class Transformer(nn.Module):
   activation: str = 'gelu'
   normalization: str = 'none'
   max_seq_len: int = 512
+  pos_embed: str = 'learned'
+  rope_base: float = 10000.0
 
   @nn.compact
   def __call__(self, x, train: bool = False):
@@ -142,17 +177,21 @@ class Transformer(nn.Module):
     tok_embed = nn.Embed(self.vocab_size, self.d_model, name='tok_embed')
     x = tok_embed(x)
 
-    # Fixed-size table sliced to seq_len, so params stay valid across calls with different lengths
-    # (needed for autoregressive generation, which calls the model on growing prefixes).
-    pos_embed = nn.Embed(self.max_seq_len, self.d_model, name='pos_embed')(jnp.arange(seq_len, dtype=jnp.int32))
-    
-    x = x + pos_embed
-    
+    if self.pos_embed == 'learned':
+      # Fixed-size table sliced to seq_len, so params stay valid across calls with different lengths
+      # (needed for autoregressive generation, which calls the model on growing prefixes).
+      pos_embed = nn.Embed(self.max_seq_len, self.d_model, name='pos_embed')(jnp.arange(seq_len, dtype=jnp.int32))
+      x = x + pos_embed
+    elif self.pos_embed != 'rope':
+      # 'rope' adds nothing here; it rotates q/k inside every attention block instead.
+      raise ValueError(f"Invalid pos_embed: {self.pos_embed}")
+
 
     for _ in range(self.n_layers):
       residual = x
       x = Normalization(self.normalization)(x, train=train)
-      x = Attention(n_heads=self.n_heads, d_model=self.d_model, use_bias=self.use_bias)(x, train=train)
+      x = Attention(n_heads=self.n_heads, d_model=self.d_model, use_bias=self.use_bias,
+                    pos_embed=self.pos_embed, rope_base=self.rope_base)(x, train=train)
       x = x + residual
       
       residual = x
@@ -238,6 +277,14 @@ def parse_args():
   parser.add_argument('--use-bias', action='store_true', default=False)
   parser.add_argument('--activation', type=str, default='silu', choices=['gelu', 'relu', 'swish', 'silu', 'mish', 'tanh', 'sigmoid', 'none'])
   parser.add_argument('--normalization', type=str, default='rms', choices=['layer', 'rms', 'none'])
+  parser.add_argument('--pos-embed', type=str, default='learned', choices=['learned', 'rope'],
+                       help="Positional embedding. 'learned' adds a trainable per-position vector to the "
+                            "token embeddings; 'rope' adds no parameters and instead rotates q/k channel "
+                            "pairs by a position-dependent angle inside every attention block, so attention "
+                            "logits depend on relative distance. With an odd head dimension "
+                            "(d-model // n-heads) the leftover channel is left unrotated.")
+  parser.add_argument('--rope-base', type=float, default=10000.0,
+                       help="Base of the RoPE frequency geometric series. Only used with --pos-embed rope.")
   parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'muon'],
                        help="Optimizer to use. 'muon' orthogonalizes updates for 2D params (Newton-schulz) "
                             "and falls back to AdamW for the rest (embeddings, norms, biases).")
@@ -292,6 +339,8 @@ def main():
   use_bias = args.use_bias
   activation = args.activation
   normalization = args.normalization
+  pos_embed = args.pos_embed
+  rope_base = args.rope_base
   num_steps = args.num_steps
   learning_rate = args.learning_rate
   lr_schedule_name = args.lr_schedule
@@ -323,6 +372,8 @@ def main():
     'use_bias': use_bias,
     'activation': activation,
     'normalization': normalization,
+    'pos_embed': pos_embed,
+    'rope_base': rope_base,
     'learning_rate': learning_rate,
     'lr_schedule': lr_schedule_name,
     'warmup_steps': warmup_steps,
@@ -345,6 +396,8 @@ def main():
     activation=activation,
     normalization=normalization,
     max_seq_len=task.episode_length(sequence_length1, sequence_length2),
+    pos_embed=pos_embed,
+    rope_base=rope_base,
   )
 
   rng_key = jax.random.key(seed)
