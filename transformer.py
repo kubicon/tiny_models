@@ -194,10 +194,10 @@ def save_checkpoint(checkpoint_dir: str, step: int, params, opt_state, hparams: 
     }, f)
 
 
-def parse_num_length_schedule(schedule_args, default_length: int, default_steps: int):
+def parse_num_length_schedule(schedule_args, default_length1: int, default_length2: int, default_steps: int):
   """Parses ["N1:N2:ITERS", ...] into [(n1, n2, iters), ...]. "N:ITERS" is shorthand for
   "N:N:ITERS" (same max size for both operands). Any remaining steps (default_steps minus the
-  sum of the given ITERS) are appended as a final (default_length, default_length, remaining)
+  sum of the given ITERS) are appended as a final (default_length1, default_length2, remaining)
   entry, so the schedule doesn't need to spell out the final stage explicitly."""
 
   schedule = []
@@ -215,7 +215,7 @@ def parse_num_length_schedule(schedule_args, default_length: int, default_steps:
 
   remaining_steps = default_steps - sum(iters for _, _, iters in schedule)
   if remaining_steps > 0:
-    schedule.append((default_length, default_length, remaining_steps))
+    schedule.append((default_length1, default_length2, remaining_steps))
 
   return schedule
 
@@ -225,7 +225,10 @@ def parse_args():
   parser.add_argument('--task', type=str, default='add', choices=sorted(TASKS),
                        help="Arithmetic task to train on. The task owns its symbols, so the vocabulary "
                             "size follows from it (10 digits, op, =, <EOS> -> 13) and is not configurable.")
-  parser.add_argument('--sequence-length', type=int, default=10)
+  parser.add_argument('--sequence-length', type=int, nargs='+', default=[10],
+                       help="Rendered digit width of the operands: one value sizes both operands, "
+                            "two values (N1 N2) size the first and second operand independently, "
+                            "e.g. --sequence-length 5 1 for a single-digit second operand.")
   parser.add_argument('--batch-size', type=int, default=512)
   parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--d-model', type=int, default=7)
@@ -273,7 +276,13 @@ def main():
   args = parse_args()
   task = TASKS[args.task]()
   vocab_size = task.vocab_size
-  sequence_length = args.sequence_length
+  if len(args.sequence_length) == 1:
+    sequence_length1 = sequence_length2 = args.sequence_length[0]
+  elif len(args.sequence_length) == 2:
+    sequence_length1, sequence_length2 = args.sequence_length
+  else:
+    raise ValueError(
+      f"--sequence-length takes 1 or 2 values, got {len(args.sequence_length)}: {args.sequence_length}")
   batch_size = args.batch_size
   seed = args.seed
   d_model = args.d_model
@@ -291,7 +300,7 @@ def main():
   grad_clip_norm = args.grad_clip_norm
   optimizer_name = args.optimizer
   num_length_schedule = parse_num_length_schedule(
-    args.num_length_schedule, sequence_length, num_steps)
+    args.num_length_schedule, sequence_length1, sequence_length2, num_steps)
   # The curriculum is the authority on how many steps actually run (an explicit schedule may
   # overshoot --num-steps), so the LR decays over that horizon, not over --num-steps.
   total_steps = sum(iters for _, _, iters in num_length_schedule)
@@ -304,7 +313,7 @@ def main():
     'task': task.name,
     # Derived from the task, recorded so a checkpoint stays self-describing.
     'vocab_size': vocab_size,
-    'sequence_length': sequence_length,
+    'sequence_length': [sequence_length1, sequence_length2],
     'batch_size': batch_size,
     'seed': seed,
     'd_model': d_model,
@@ -321,7 +330,7 @@ def main():
     'grad_clip_norm': grad_clip_norm,
     'optimizer': optimizer_name,
     'total_steps': total_steps,
-    'max_seq_len': task.episode_length(sequence_length, sequence_length),
+    'max_seq_len': task.episode_length(sequence_length1, sequence_length2),
     'num_length_schedule': num_length_schedule,
     'steps_per_chunk': steps_per_chunk,
   }
@@ -335,12 +344,12 @@ def main():
     hidden_dims=hidden_dims,
     activation=activation,
     normalization=normalization,
-    max_seq_len=task.episode_length(sequence_length, sequence_length),
+    max_seq_len=task.episode_length(sequence_length1, sequence_length2),
   )
 
   rng_key = jax.random.key(seed)
   rng_key, example_key = jax.random.split(rng_key)
-  example_sequence = generate_episode(task, sequence_length, sequence_length, 1, example_key)[0]
+  example_sequence = generate_episode(task, sequence_length1, sequence_length2, 1, example_key)[0]
   rng_key, init_key = jax.random.split(rng_key)
   params = transformer.init(init_key, example_sequence, train=False)
 
@@ -384,14 +393,14 @@ def main():
   
   # Static: the answer span always begins at the same offset, so the loss is a compile-time
   # slice rather than a runtime mask.
-  answer_start = task.answer_start_index(sequence_length, sequence_length)
+  answer_start = task.answer_start_index(sequence_length1, sequence_length2)
 
   def train_step(opt, rng_key, num_length1, num_length2):
     """One optimizer step. Written as a lax.scan body (carry -> (carry, y)) so a whole chunk
     of steps can be fused into a single dispatch by train_chunk."""
 
     batch = generate_episode(
-      task, sequence_length, sequence_length, batch_size, rng_key, num_length1, num_length2)
+      task, sequence_length1, sequence_length2, batch_size, rng_key, num_length1, num_length2)
     params, state = opt
 
     def loss_fn(params, sequences):
@@ -426,9 +435,9 @@ def main():
   @jax.jit
   def validate(params, rng_key):
     prompts, target_digits, (a, b) = generate_validation_prompts(
-      task, sequence_length, sequence_length, num_samples, rng_key)
+      task, sequence_length1, sequence_length2, num_samples, rng_key)
 
-    n_output_digits = task.answer_length(sequence_length, sequence_length)
+    n_output_digits = task.answer_length(sequence_length1, sequence_length2)
     generated_digits = generate_tokens(transformer, params, prompts, n_output_digits)
     # The model was trained to emit the answer reversed (LSB-first); flip back to compare digit-for-digit.
     predicted_digits = jnp.flip(generated_digits, axis=-1)
