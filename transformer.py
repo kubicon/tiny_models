@@ -47,6 +47,8 @@ class Attention(nn.Module):
   use_bias: bool = True
   pos_embed: str = 'learned'
   rope_base: float = 10000.0
+  qk_norm: bool = False
+  n_kv_heads: int = 0  # 0 means "same as n_heads", i.e. plain multi-head attention
   
   
   @nn.compact
@@ -54,9 +56,20 @@ class Attention(nn.Module):
     seq_len, embed_dim = x.shape
     
     head_dim = embed_dim // self.n_heads
-    
-    qkv = nn.Dense(3 * embed_dim, use_bias=self.use_bias, name='qkv_proj')(x)
-    q, k, v = jnp.split(qkv, 3, axis=-1)
+    n_kv_heads = self.n_kv_heads or self.n_heads
+    if self.n_heads % n_kv_heads != 0:
+      raise ValueError(f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({n_kv_heads})")
+
+    if n_kv_heads == self.n_heads:
+      # Plain MHA keeps the single fused projection, so checkpoints trained before GQA existed
+      # still load under the same parameter names.
+      qkv = nn.Dense(3 * embed_dim, use_bias=self.use_bias, name='qkv_proj')(x)
+      q, k, v = jnp.split(qkv, 3, axis=-1)
+    else:
+      # GQA: k/v are narrower than q, so they need their own projections.
+      q = nn.Dense(self.n_heads * head_dim, use_bias=self.use_bias, name='q_proj')(x)
+      k = nn.Dense(n_kv_heads * head_dim, use_bias=self.use_bias, name='k_proj')(x)
+      v = nn.Dense(n_kv_heads * head_dim, use_bias=self.use_bias, name='v_proj')(x)
     
     
     # q1 = q.reshape(seq_len, self.n_heads, head_dim).transpose(1, 0, 2)
@@ -72,12 +85,25 @@ class Attention(nn.Module):
     # out = out.transpose(0, 2, 1, 3).reshape(B, T, C)
 
     q = q.reshape(seq_len, self.n_heads, head_dim)
-    k = k.reshape(seq_len, self.n_heads, head_dim)
-    v = v.reshape(seq_len, self.n_heads, head_dim)
+    k = k.reshape(seq_len, n_kv_heads, head_dim)
+    v = v.reshape(seq_len, n_kv_heads, head_dim)
+
+    if self.qk_norm:
+      # Qwen3-style QK-norm: an RMSNorm over the head dimension applied to q and k before RoPE.
+      # The scale is shared across heads (one vector of head_dim), and it comes before the
+      # rotation so the rotation stays a pure rotation of unit-scale vectors.
+      q = nn.RMSNorm(name='q_norm')(q)
+      k = nn.RMSNorm(name='k_norm')(k)
 
     if self.pos_embed == 'rope':
       q = apply_rope(q, self.rope_base)
       k = apply_rope(k, self.rope_base)
+
+    # Each key/value head is shared by n_heads // n_kv_heads consecutive query heads. Normalizing
+    # and rotating before the expansion is equivalent and cheaper, since the copies are identical.
+    if n_kv_heads != self.n_heads:
+      k = jnp.repeat(k, self.n_heads // n_kv_heads, axis=1)
+      v = jnp.repeat(v, self.n_heads // n_kv_heads, axis=1)
 
     attention = jnp.einsum('ijk,ljk->ilj', q, k)
     attention = attention / jnp.sqrt(head_dim)
@@ -166,6 +192,8 @@ class Transformer(nn.Module):
   max_seq_len: int = 512
   pos_embed: str = 'learned'
   rope_base: float = 10000.0
+  qk_norm: bool = False
+  n_kv_heads: int = 0
 
   @nn.compact
   def __call__(self, x, train: bool = False):
@@ -191,7 +219,8 @@ class Transformer(nn.Module):
       residual = x
       x = Normalization(self.normalization)(x, train=train)
       x = Attention(n_heads=self.n_heads, d_model=self.d_model, use_bias=self.use_bias,
-                    pos_embed=self.pos_embed, rope_base=self.rope_base)(x, train=train)
+                    pos_embed=self.pos_embed, rope_base=self.rope_base,
+                    qk_norm=self.qk_norm, n_kv_heads=self.n_kv_heads)(x, train=train)
       x = x + residual
       
       residual = x
@@ -285,6 +314,14 @@ def parse_args():
                             "(d-model // n-heads) the leftover channel is left unrotated.")
   parser.add_argument('--rope-base', type=float, default=10000.0,
                        help="Base of the RoPE frequency geometric series. Only used with --pos-embed rope.")
+  parser.add_argument('--n-kv-heads', type=int, default=0,
+                       help="Number of key/value heads for grouped-query attention. 0 (the default) means "
+                            "one k/v head per query head, i.e. plain multi-head attention. Must divide "
+                            "--n-heads; each k/v head is then shared by n-heads // n-kv-heads query heads.")
+  parser.add_argument('--qk-norm', action='store_true', default=False,
+                       help="Apply a Qwen3-style RMSNorm over the head dimension to q and k before RoPE. "
+                            "Adds 2 * (d-model // n-heads) parameters per layer and keeps attention logits "
+                            "at a stable scale.")
   parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'muon'],
                        help="Optimizer to use. 'muon' orthogonalizes updates for 2D params (Newton-schulz) "
                             "and falls back to AdamW for the rest (embeddings, norms, biases).")
@@ -341,6 +378,8 @@ def main():
   normalization = args.normalization
   pos_embed = args.pos_embed
   rope_base = args.rope_base
+  qk_norm = args.qk_norm
+  n_kv_heads = args.n_kv_heads
   num_steps = args.num_steps
   learning_rate = args.learning_rate
   lr_schedule_name = args.lr_schedule
@@ -374,6 +413,8 @@ def main():
     'normalization': normalization,
     'pos_embed': pos_embed,
     'rope_base': rope_base,
+    'qk_norm': qk_norm,
+    'n_kv_heads': n_kv_heads,
     'learning_rate': learning_rate,
     'lr_schedule': lr_schedule_name,
     'warmup_steps': warmup_steps,
@@ -398,6 +439,8 @@ def main():
     max_seq_len=task.episode_length(sequence_length1, sequence_length2),
     pos_embed=pos_embed,
     rope_base=rope_base,
+    qk_norm=qk_norm,
+    n_kv_heads=n_kv_heads,
   )
 
   rng_key = jax.random.key(seed)
