@@ -18,7 +18,9 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from task import TASKS, generate_episode, generate_validation_prompts, digits_to_int
+from task import (
+  TASKS, answer_token_mask, format_answer_tokens, generate_episode, generate_validation_prompts,
+)
 from transformer import Transformer, generate_tokens, save_checkpoint
 
 
@@ -45,6 +47,7 @@ def build_model(hparams):
     d_model=hparams['d_model'],
     use_bias=hparams['use_bias'],
     n_layers=hparams['n_layers'],
+    recurrent_steps=hparams.get('recurrent_steps', 1),
     vocab_size=hparams['vocab_size'],
     hidden_dims=tuple(hparams['hidden_dims']),
     activation=hparams['activation'],
@@ -95,6 +98,8 @@ def main():
 
   task, transformer = build_model(hparams)
   sequence_length1, sequence_length2 = hparams['sequence_length']
+  reverse_operands = hparams.get('reverse_operands', False)
+  early_eos = hparams.get('early_eos', False)
   if args.num_length is None:
     num_length1, num_length2 = sequence_length1, sequence_length2
   elif len(args.num_length) == 1:
@@ -126,7 +131,8 @@ def main():
   rng_key = jax.random.key(args.seed)
   rng_key, batch_key = jax.random.split(rng_key)
   batch = generate_episode(
-    task, sequence_length1, sequence_length2, args.batch_size, batch_key, num_length1, num_length2)
+    task, sequence_length1, sequence_length2, args.batch_size, batch_key, num_length1, num_length2,
+    reverse_operands=reverse_operands, early_eos=early_eos)
 
   answer_start = task.answer_start_index(sequence_length1, sequence_length2)
 
@@ -135,6 +141,9 @@ def main():
       logits = transformer.apply(params, sequence, train=True)
       loss = optax.softmax_cross_entropy_with_integer_labels(
         logits[answer_start:-1], sequence[answer_start + 1:])
+      if early_eos:
+        mask = answer_token_mask(sequence[answer_start + 1:], task.eos_token)
+        return (loss * mask).sum() / mask.sum()
       return loss.mean()
     return jax.vmap(loss_fn_single)(batch).mean()
 
@@ -162,13 +171,18 @@ def main():
   @jax.jit
   def validate(params, rng_key):
     prompts, target_digits, (a, b) = generate_validation_prompts(
-      task, sequence_length1, sequence_length2, args.num_samples, rng_key)
+      task, sequence_length1, sequence_length2, args.num_samples, rng_key,
+      reverse_operands=reverse_operands)
 
     n_output_digits = task.answer_length(sequence_length1, sequence_length2)
-    generated_digits = generate_tokens(transformer, params, prompts, n_output_digits)
-    predicted_digits = jnp.flip(generated_digits, axis=-1)
-
-    correct = jnp.all(predicted_digits == target_digits, axis=-1)
+    n_output_tokens = n_output_digits + 1 if early_eos else n_output_digits
+    generated_tokens = generate_tokens(transformer, params, prompts, n_output_tokens)
+    if early_eos:
+      target_tokens = format_answer_tokens(task, target_digits, early_eos=True)
+      target_mask = answer_token_mask(target_tokens, task.eos_token)
+      correct = jnp.all((generated_tokens == target_tokens) | ~target_mask, axis=-1)
+    else:
+      correct = jnp.all(jnp.flip(generated_tokens, axis=-1) == target_digits, axis=-1)
     return {'accuracy': jnp.mean(correct)}
 
   rng_key, val_key = jax.random.split(rng_key)

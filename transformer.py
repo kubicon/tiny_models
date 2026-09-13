@@ -10,7 +10,10 @@ from typing import Sequence
 
 import optax
 
-from task import TASKS, generate_episode, generate_validation_prompts, digits_to_int
+from task import (
+  TASKS, answer_token_mask, digits_to_int, format_answer_tokens, generate_episode,
+  generate_validation_prompts,
+)
 
 
 def apply_rope(x, base: float = 10000.0):
@@ -185,6 +188,7 @@ class Transformer(nn.Module):
   d_model: int = 512
   use_bias: bool = True
   n_layers: int = 6
+  recurrent_steps: int = 1
   vocab_size: int = 12
   hidden_dims: Sequence[int] = (32, 32)
   activation: str = 'gelu'
@@ -215,18 +219,33 @@ class Transformer(nn.Module):
       raise ValueError(f"Invalid pos_embed: {self.pos_embed}")
 
 
+    if self.recurrent_steps < 1:
+      raise ValueError(f"recurrent_steps must be at least 1, got {self.recurrent_steps}")
+
     for _ in range(self.n_layers):
-      residual = x
-      x = Normalization(self.normalization)(x, train=train)
-      x = Attention(n_heads=self.n_heads, d_model=self.d_model, use_bias=self.use_bias,
-                    pos_embed=self.pos_embed, rope_base=self.rope_base,
-                    qk_norm=self.qk_norm, n_kv_heads=self.n_kv_heads)(x, train=train)
-      x = x + residual
-      
-      residual = x
-      x = Normalization(self.normalization)(x, train=train)
-      x = MLP(hidden_dims=self.hidden_dims, out_dim=self.d_model, activation=self.activation, use_bias=self.use_bias)(x, train=train)
-      x = x + residual
+      # Construct each block's modules once, then call those same module instances repeatedly.
+      # Linen consequently reuses their parameters while the activation x is refined on every
+      # recurrent step. With recurrent_steps=1 this is the original, ordinary Transformer block.
+      attn_norm = Normalization(self.normalization)
+      attention = Attention(
+        n_heads=self.n_heads, d_model=self.d_model, use_bias=self.use_bias,
+        pos_embed=self.pos_embed, rope_base=self.rope_base,
+        qk_norm=self.qk_norm, n_kv_heads=self.n_kv_heads)
+      mlp_norm = Normalization(self.normalization)
+      mlp = MLP(
+        hidden_dims=self.hidden_dims, out_dim=self.d_model, activation=self.activation,
+        use_bias=self.use_bias)
+
+      for _ in range(self.recurrent_steps):
+        residual = x
+        x = attn_norm(x, train=train)
+        x = attention(x, train=train)
+        x = x + residual
+
+        residual = x
+        x = mlp_norm(x, train=train)
+        x = mlp(x, train=train)
+        x = x + residual
       
     x = Normalization(self.normalization)(x, train=train)
     # Tied output projection: logits = x @ tok_embed.embedding.T, with no separate decoder matrix
@@ -297,11 +316,21 @@ def parse_args():
                        help="Rendered digit width of the operands: one value sizes both operands, "
                             "two values (N1 N2) size the first and second operand independently, "
                             "e.g. --sequence-length 5 1 for a single-digit second operand.")
+  parser.add_argument('--reverse-operands', action='store_true', default=False,
+                       help="Render each operand LSB-first so its digit order agrees with the LSB-first answer. "
+                            "The default keeps operands MSB-first.")
+  parser.add_argument('--early-eos', action='store_true', default=False,
+                       help="Emit <EOS> immediately after the most significant nonzero answer digit instead "
+                            "of training on leading zero answer padding. Disabled by default.")
   parser.add_argument('--batch-size', type=int, default=512)
   parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--d-model', type=int, default=7)
   parser.add_argument('--n-heads', type=int, default=1)
   parser.add_argument('--n-layers', type=int, default=1)
+  parser.add_argument('--recurrent-steps', type=int, default=1,
+                       help="Number of times to apply each Transformer block with shared weights. "
+                            "1 (the default) is an ordinary non-recurrent block; values above 1 "
+                            "add iterative computation without adding block parameters.")
   parser.add_argument('--hidden-dims', type=int, nargs='+', default=[8])
   parser.add_argument('--use-bias', action='store_true', default=False)
   parser.add_argument('--activation', type=str, default='silu', choices=['gelu', 'relu', 'swish', 'silu', 'mish', 'tanh', 'sigmoid', 'none'])
@@ -370,10 +399,13 @@ def main():
     raise ValueError(
       f"--sequence-length takes 1 or 2 values, got {len(args.sequence_length)}: {args.sequence_length}")
   batch_size = args.batch_size
+  reverse_operands = args.reverse_operands
+  early_eos = args.early_eos
   seed = args.seed
   d_model = args.d_model
   n_heads = args.n_heads
   n_layers = args.n_layers
+  recurrent_steps = args.recurrent_steps
   hidden_dims = tuple(args.hidden_dims)
   use_bias = args.use_bias
   activation = args.activation
@@ -406,10 +438,13 @@ def main():
     'vocab_size': vocab_size,
     'sequence_length': [sequence_length1, sequence_length2],
     'batch_size': batch_size,
+    'reverse_operands': reverse_operands,
+    'early_eos': early_eos,
     'seed': seed,
     'd_model': d_model,
     'n_heads': n_heads,
     'n_layers': n_layers,
+    'recurrent_steps': recurrent_steps,
     'hidden_dims': hidden_dims,
     'use_bias': use_bias,
     'activation': activation,
@@ -436,6 +471,7 @@ def main():
     d_model=d_model,
     use_bias=use_bias,
     n_layers=n_layers,
+    recurrent_steps=recurrent_steps,
     vocab_size=vocab_size,
     hidden_dims=hidden_dims,
     activation=activation,
@@ -449,7 +485,9 @@ def main():
 
   rng_key = jax.random.key(seed)
   rng_key, example_key = jax.random.split(rng_key)
-  example_sequence = generate_episode(task, sequence_length1, sequence_length2, 1, example_key)[0]
+  example_sequence = generate_episode(
+    task, sequence_length1, sequence_length2, 1, example_key,
+    reverse_operands=reverse_operands, early_eos=early_eos)[0]
   rng_key, init_key = jax.random.split(rng_key)
   params = transformer.init(init_key, example_sequence, train=False)
 
@@ -500,7 +538,8 @@ def main():
     of steps can be fused into a single dispatch by train_chunk."""
 
     batch = generate_episode(
-      task, sequence_length1, sequence_length2, batch_size, rng_key, num_length1, num_length2)
+      task, sequence_length1, sequence_length2, batch_size, rng_key, num_length1, num_length2,
+      reverse_operands=reverse_operands, early_eos=early_eos)
     params, state = opt
 
     def loss_fn(params, sequences):
@@ -511,6 +550,9 @@ def main():
         # digits, so including them just dilutes the gradient and floors the reported loss.
         loss = optax.softmax_cross_entropy_with_integer_labels(
           logits[answer_start:-1], sequence[answer_start + 1:])
+        if early_eos:
+          mask = answer_token_mask(sequence[answer_start + 1:], task.eos_token)
+          return (loss * mask).sum() / mask.sum()
         return loss.mean()
       losses = jax.vmap(loss_fn_single)(sequences)
       return losses.mean()
@@ -535,14 +577,26 @@ def main():
   @jax.jit
   def validate(params, rng_key):
     prompts, target_digits, (a, b) = generate_validation_prompts(
-      task, sequence_length1, sequence_length2, num_samples, rng_key)
+      task, sequence_length1, sequence_length2, num_samples, rng_key,
+      reverse_operands=reverse_operands)
 
     n_output_digits = task.answer_length(sequence_length1, sequence_length2)
-    generated_digits = generate_tokens(transformer, params, prompts, n_output_digits)
+    n_output_tokens = n_output_digits + 1 if early_eos else n_output_digits
+    generated_tokens = generate_tokens(transformer, params, prompts, n_output_tokens)
     # The model was trained to emit the answer reversed (LSB-first); flip back to compare digit-for-digit.
+    if early_eos:
+      target_tokens = format_answer_tokens(task, target_digits, early_eos=True)
+      target_mask = answer_token_mask(target_tokens, task.eos_token)
+      correct = jnp.all((generated_tokens == target_tokens) | ~target_mask, axis=-1)
+      # Keep the existing numeric diagnostic useful. EOS and anything after it decode as zero.
+      before_eos = jnp.cumsum(generated_tokens == task.eos_token, axis=-1) == 0
+      generated_digits = jnp.where(
+        before_eos[:, :n_output_digits] & (generated_tokens[:, :n_output_digits] < 10),
+        generated_tokens[:, :n_output_digits], 0)
+    else:
+      generated_digits = generated_tokens
+      correct = jnp.all(jnp.flip(generated_digits, axis=-1) == target_digits, axis=-1)
     predicted_digits = jnp.flip(generated_digits, axis=-1)
-
-    correct = jnp.all(predicted_digits == target_digits, axis=-1)
 
     return {
       'accuracy': jnp.mean(correct),

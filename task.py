@@ -118,7 +118,7 @@ TASKS = {task.name: task for task in (AdditionTask, MultiplicationTask)}
 
 def generate_prompts(
     task: Task, max_length1: int, max_length2: int, batch_size: int, rng,
-    num_length1: int = None, num_length2: int = None):
+    num_length1: int = None, num_length2: int = None, reverse_operands: bool = False):
   """Samples an operand pair per row and renders the prompt 'N1 op N2 ='.
 
   When `num_length1` (resp. `num_length2`) is given, each row independently draws that operand's
@@ -155,29 +155,70 @@ def generate_prompts(
   op_tokens = jnp.full((batch_size, 1), task.op_token)
   eq_tokens = jnp.full((batch_size, 1), task.eq_token)
 
-  prompts = jnp.concatenate((a, op_tokens, b, eq_tokens), axis=-1)
+  # The arithmetic is computed from the conventional MSB-first representation above. Only the
+  # rendered prompt is reversed, making its digit order agree with the LSB-first answer order.
+  prompt_a = jnp.flip(a, axis=-1) if reverse_operands else a
+  prompt_b = jnp.flip(b, axis=-1) if reverse_operands else b
+  prompts = jnp.concatenate((prompt_a, op_tokens, prompt_b, eq_tokens), axis=-1)
 
   return prompts, (a, b), answer_digits
 
 
 def generate_episode(
     task: Task, max_length1: int, max_length2: int, batch_size: int, rng,
-    num_length1: int = None, num_length2: int = None):
+    num_length1: int = None, num_length2: int = None, reverse_operands: bool = False,
+    early_eos: bool = False):
   """A full training sequence: the prompt, then the answer emitted LSB-first, then <EOS>."""
 
   prompts, _, answer_digits = generate_prompts(
-    task, max_length1, max_length2, batch_size, rng, num_length1, num_length2)
-  eos_tokens = jnp.full((batch_size, 1), task.eos_token)
+    task, max_length1, max_length2, batch_size, rng, num_length1, num_length2,
+    reverse_operands=reverse_operands)
+  answer_tokens = format_answer_tokens(task, answer_digits, early_eos)
 
-  return jnp.concatenate((prompts, jnp.flip(answer_digits, axis=-1), eos_tokens), axis=-1)
+  return jnp.concatenate((prompts, answer_tokens), axis=-1)
 
 
-def generate_validation_prompts(task: Task, max_length1: int, max_length2: int, batch_size: int, rng):
+def generate_validation_prompts(
+    task: Task, max_length1: int, max_length2: int, batch_size: int, rng,
+    reverse_operands: bool = False):
   """Same sampling as generate_episode, but stops after '=' (no target digits)."""
 
-  prompts, operands, answer_digits = generate_prompts(task, max_length1, max_length2, batch_size, rng)
+  prompts, operands, answer_digits = generate_prompts(
+    task, max_length1, max_length2, batch_size, rng, reverse_operands=reverse_operands)
 
   return prompts, answer_digits, operands
+
+
+def format_answer_tokens(task: Task, answer_digits: jnp.ndarray, early_eos: bool = False):
+  """Formats MSB-first answers as fixed-shape, LSB-first autoregressive targets.
+
+  With early_eos enabled, leading zeroes in the conventional MSB-first representation are
+  omitted and EOS follows the last significant digit. The remaining fixed-width batch slots are
+  also filled with EOS; callers should mask targets after the first EOS. Zero itself retains one
+  output digit, so its target is ``0, EOS`` rather than an empty answer.
+  """
+
+  answer_lsb = jnp.flip(answer_digits, axis=-1)
+  eos_shape = answer_digits.shape[:-1] + (1,)
+  eos_tokens = jnp.full(eos_shape, task.eos_token, dtype=answer_digits.dtype)
+  if not early_eos:
+    return jnp.concatenate((answer_lsb, eos_tokens), axis=-1)
+
+  answer_length = answer_digits.shape[-1]
+  has_nonzero = jnp.any(answer_digits != 0, axis=-1)
+  first_nonzero = jnp.argmax(answer_digits != 0, axis=-1)
+  significant_length = jnp.where(has_nonzero, answer_length - first_nonzero, 1)
+
+  # Append one safe slot for the EOS position, then replace EOS and all padding positions below.
+  answer_and_slot = jnp.concatenate((answer_lsb, jnp.zeros_like(eos_tokens)), axis=-1)
+  positions = jnp.arange(answer_length + 1)
+  return jnp.where(positions < significant_length[..., None], answer_and_slot, task.eos_token)
+
+
+def answer_token_mask(targets: jnp.ndarray, eos_token: int):
+  """Mask containing all answer digits and the first EOS, but no fixed-shape EOS padding."""
+
+  return jnp.cumsum(targets == eos_token, axis=-1) <= 1
 
 
 def digits_to_int(digits: jnp.ndarray, msb_first: bool = True):
