@@ -347,6 +347,8 @@ def parse_args():
                        help="Absolute learning rate the cosine decays to at the final step.")
   parser.add_argument('--grad-clip-norm', type=float, default=1.0,
                        help="Clip gradients to this global norm before the optimizer update. Set to 0 to disable.")
+  parser.add_argument('--weight-decay', type=float, default=1e-2,
+                       help="Weight decay coefficient passed to the optimizer (AdamW or Muon).")
   parser.add_argument('--num-samples', type=int, default=1000)
   parser.add_argument('--checkpoint-dir', type=str, default="data/transformer_777", help="Folder to store checkpoints in. If not set, no checkpoints are saved.")
   parser.add_argument('--checkpoint-every', type=int, default=1000, help="Save a checkpoint every N steps.")
@@ -386,6 +388,7 @@ def main():
   warmup_steps = args.warmup_steps
   lr_min = args.lr_min
   grad_clip_norm = args.grad_clip_norm
+  weight_decay = args.weight_decay
   optimizer_name = args.optimizer
   num_length_schedule = parse_num_length_schedule(
     args.num_length_schedule, sequence_length1, sequence_length2, num_steps)
@@ -420,6 +423,7 @@ def main():
     'warmup_steps': warmup_steps,
     'lr_min': lr_min,
     'grad_clip_norm': grad_clip_norm,
+    'weight_decay': weight_decay,
     'optimizer': optimizer_name,
     'total_steps': total_steps,
     'max_seq_len': task.episode_length(sequence_length1, sequence_length2),
@@ -480,9 +484,9 @@ def main():
     lr_schedule = optax.constant_schedule(learning_rate)
 
   if optimizer_name == 'muon':
-    optimizer = optax.contrib.muon(learning_rate=lr_schedule, weight_decay=1e-2)
+    optimizer = optax.contrib.muon(learning_rate=lr_schedule, weight_decay=weight_decay)
   else:
-    optimizer = optax.adamw(learning_rate=lr_schedule,  weight_decay=1e-2)
+    optimizer = optax.adamw(learning_rate=lr_schedule, weight_decay=weight_decay)
   if grad_clip_norm > 0:
     optimizer = optax.chain(optax.clip_by_global_norm(grad_clip_norm), optimizer)
   state = optimizer.init(params)
