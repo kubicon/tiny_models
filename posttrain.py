@@ -21,7 +21,7 @@ import optax
 from task import (
   TASKS, answer_token_mask, format_answer_tokens, generate_episode, generate_validation_prompts,
 )
-from transformer import Transformer, generate_tokens, save_checkpoint
+from transformer import build_transformer, generate_tokens, model_logits, save_checkpoint
 
 
 def load_checkpoint(checkpoint_path):
@@ -42,22 +42,7 @@ def load_checkpoint(checkpoint_path):
 
 def build_model(hparams):
   task = TASKS[hparams['task']]()
-  transformer = Transformer(
-    n_heads=hparams['n_heads'],
-    d_model=hparams['d_model'],
-    use_bias=hparams['use_bias'],
-    n_layers=hparams['n_layers'],
-    recurrent_steps=hparams.get('recurrent_steps', 1),
-    vocab_size=hparams['vocab_size'],
-    hidden_dims=tuple(hparams['hidden_dims']),
-    activation=hparams['activation'],
-    normalization=hparams['normalization'],
-    max_seq_len=hparams['max_seq_len'],
-    pos_embed=hparams.get('pos_embed', 'learned'),
-    rope_base=hparams.get('rope_base', 10000.0),
-    qk_norm=hparams.get('qk_norm', False),
-    n_kv_heads=hparams.get('n_kv_heads', 0),
-  )
+  transformer = build_transformer(hparams)
   return task, transformer
 
 
@@ -138,7 +123,7 @@ def main():
 
   def loss_fn(params):
     def loss_fn_single(sequence):
-      logits = transformer.apply(params, sequence, train=True)
+      logits = model_logits(transformer, params, sequence, train=True)
       loss = optax.softmax_cross_entropy_with_integer_labels(
         logits[answer_start:-1], sequence[answer_start + 1:])
       if early_eos:

@@ -255,10 +255,117 @@ class Transformer(nn.Module):
     return x
 
 
+class MemoryTransformer(nn.Module):
+  """Causal Transformer pass with explicit, per-position recurrent memory.
+
+  A call processes the sequence once and returns (logits, new_memory). Calling it again with
+  the same tokens and new_memory refines the state; intermediate token predictions are ignored.
+  Memory is aligned with token positions, so causal attention keeps every position independent
+  of later tokens even when the same sequence is processed repeatedly.
+  """
+
+  n_heads: int = 8
+  d_model: int = 512
+  use_bias: bool = True
+  n_layers: int = 6
+  recurrent_steps: int = 1
+  memory_passes: int = 2
+  vocab_size: int = 12
+  hidden_dims: Sequence[int] = (32, 32)
+  activation: str = 'gelu'
+  normalization: str = 'none'
+  max_seq_len: int = 512
+  pos_embed: str = 'learned'
+  rope_base: float = 10000.0
+  qk_norm: bool = False
+  n_kv_heads: int = 0
+
+  @nn.compact
+  def __call__(self, tokens, memory, train: bool = False):
+    if self.recurrent_steps < 1:
+      raise ValueError(f"recurrent_steps must be at least 1, got {self.recurrent_steps}")
+    if self.memory_passes < 1:
+      raise ValueError(f"memory_passes must be at least 1, got {self.memory_passes}")
+
+    seq_len = tokens.shape[0]
+    tok_embed = nn.Embed(self.vocab_size, self.d_model, name='tok_embed')
+    x = tok_embed(tokens)
+    if memory.shape != x.shape:
+      raise ValueError(f"memory must have shape {x.shape}, got {memory.shape}")
+
+    if self.pos_embed == 'learned':
+      positions = jnp.arange(seq_len, dtype=jnp.int32)
+      x = x + nn.Embed(self.max_seq_len, self.d_model, name='pos_embed')(positions)
+    elif self.pos_embed != 'rope':
+      raise ValueError(f"Invalid pos_embed: {self.pos_embed}")
+
+    # Reintroduce the input on every pass, while the recurrent state carries the computation.
+    x = x + memory
+    for _ in range(self.n_layers):
+      attn_norm = Normalization(self.normalization)
+      attention = Attention(
+        n_heads=self.n_heads, d_model=self.d_model, use_bias=self.use_bias,
+        pos_embed=self.pos_embed, rope_base=self.rope_base,
+        qk_norm=self.qk_norm, n_kv_heads=self.n_kv_heads)
+      mlp_norm = Normalization(self.normalization)
+      mlp = MLP(
+        hidden_dims=self.hidden_dims, out_dim=self.d_model, activation=self.activation,
+        use_bias=self.use_bias)
+
+      for _ in range(self.recurrent_steps):
+        residual = x
+        x = attn_norm(x, train=train)
+        x = attention(x, train=train) + residual
+
+        residual = x
+        x = mlp_norm(x, train=train)
+        x = mlp(x, train=train) + residual
+
+    new_memory = x
+    logits = Normalization(self.normalization)(new_memory, train=train)
+    return tok_embed.attend(logits), new_memory
+
+
+def build_transformer(hparams):
+  """Builds either model from checkpoint hyperparameters (including older checkpoints)."""
+  model_type = hparams.get('model_type', 'transformer')
+  if model_type not in ('transformer', 'memory'):
+    raise ValueError(f"Invalid model_type: {model_type}")
+  model_class = MemoryTransformer if model_type == 'memory' else Transformer
+  kwargs = dict(
+    n_heads=hparams['n_heads'], d_model=hparams['d_model'], use_bias=hparams['use_bias'],
+    n_layers=hparams['n_layers'], recurrent_steps=hparams.get('recurrent_steps', 1),
+    vocab_size=hparams['vocab_size'], hidden_dims=tuple(hparams['hidden_dims']),
+    activation=hparams['activation'], normalization=hparams['normalization'],
+    max_seq_len=hparams['max_seq_len'], pos_embed=hparams.get('pos_embed', 'learned'),
+    rope_base=hparams.get('rope_base', 10000.0), qk_norm=hparams.get('qk_norm', False),
+    n_kv_heads=hparams.get('n_kv_heads', 0))
+  if model_type == 'memory':
+    kwargs['memory_passes'] = hparams.get('memory_passes', 2)
+  return model_class(**kwargs)
+
+
+def model_logits(transformer, params, sequence: jnp.ndarray, train: bool = False):
+  """Starts from zero memory and returns only the final pass's token logits.
+
+  Gradients pass through every memory update during training. Generation starts from the same
+  zero state for each growing prefix, so each prediction follows the training computation.
+  """
+  if isinstance(transformer, MemoryTransformer):
+    memory = jnp.zeros((sequence.shape[0], transformer.d_model), dtype=jnp.float32)
+    def update_memory(_, state):
+      _, new_memory = transformer.apply(params, sequence, state, train=train)
+      return new_memory
+    memory = jax.lax.fori_loop(0, transformer.memory_passes - 1, update_memory, memory)
+    logits, _ = transformer.apply(params, sequence, memory, train=train)
+    return logits
+  return transformer.apply(params, sequence, train=train)
+
+
 def generate_tokens(transformer, params, prompts: jnp.ndarray, n_tokens: int):
   """Greedily decodes n_tokens continuations for each (unbatched-model) row in prompts."""
 
-  apply_single = lambda seq: transformer.apply(params, seq, train=False)
+  apply_single = lambda seq: model_logits(transformer, params, seq, train=False)
 
   sequences = prompts
   for _ in range(n_tokens):
@@ -309,6 +416,12 @@ def parse_num_length_schedule(schedule_args, default_length1: int, default_lengt
 
 def parse_args():
   parser = argparse.ArgumentParser(description="Train a tiny transformer on integer arithmetic.")
+  parser.add_argument('--model-type', choices=['transformer', 'memory'], default='transformer',
+                       help="'memory' repeatedly processes the same token sequence with an explicit "
+                            "per-position state; 'transformer' is the original model.")
+  parser.add_argument('--memory-passes', type=int, default=2,
+                       help="Number of passes over each sequence for --model-type memory. Only the "
+                            "last pass predicts tokens; gradients flow through every pass.")
   parser.add_argument('--task', type=str, default='add', choices=sorted(TASKS),
                        help="Arithmetic task to train on. The task owns its symbols, so the vocabulary "
                             "size follows from it (10 digits, op, =, <EOS> -> 13) and is not configurable.")
@@ -389,6 +502,8 @@ def parse_args():
 
 def main():
   args = parse_args()
+  if args.memory_passes < 1:
+    raise ValueError(f"--memory-passes must be at least 1, got {args.memory_passes}")
   task = TASKS[args.task]()
   vocab_size = task.vocab_size
   if len(args.sequence_length) == 1:
@@ -433,6 +548,8 @@ def main():
   steps_per_chunk = max(1, args.steps_per_chunk)
 
   hparams = {
+    'model_type': args.model_type,
+    'memory_passes': args.memory_passes,
     'task': task.name,
     # Derived from the task, recorded so a checkpoint stays self-describing.
     'vocab_size': vocab_size,
@@ -466,22 +583,7 @@ def main():
     'steps_per_chunk': steps_per_chunk,
   }
 
-  transformer = Transformer(
-    n_heads=n_heads,
-    d_model=d_model,
-    use_bias=use_bias,
-    n_layers=n_layers,
-    recurrent_steps=recurrent_steps,
-    vocab_size=vocab_size,
-    hidden_dims=hidden_dims,
-    activation=activation,
-    normalization=normalization,
-    max_seq_len=task.episode_length(sequence_length1, sequence_length2),
-    pos_embed=pos_embed,
-    rope_base=rope_base,
-    qk_norm=qk_norm,
-    n_kv_heads=n_kv_heads,
-  )
+  transformer = build_transformer(hparams)
 
   rng_key = jax.random.key(seed)
   rng_key, example_key = jax.random.split(rng_key)
@@ -489,7 +591,11 @@ def main():
     task, sequence_length1, sequence_length2, 1, example_key,
     reverse_operands=reverse_operands, early_eos=early_eos)[0]
   rng_key, init_key = jax.random.split(rng_key)
-  params = transformer.init(init_key, example_sequence, train=False)
+  if isinstance(transformer, MemoryTransformer):
+    example_memory = jnp.zeros((example_sequence.shape[0], d_model), dtype=jnp.float32)
+    params = transformer.init(init_key, example_sequence, example_memory, train=False)
+  else:
+    params = transformer.init(init_key, example_sequence, train=False)
 
   n_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
   print(f"Trainable parameters: {n_params:,}")
@@ -545,7 +651,7 @@ def main():
     def loss_fn(params, sequences):
 
       def loss_fn_single(sequence):
-        logits = transformer.apply(params, sequence, train=True)
+        logits = model_logits(transformer, params, sequence, train=True)
         # Score only the answer digits and <EOS>; the prompt targets (N1, N2) are uniform random
         # digits, so including them just dilutes the gradient and floors the reported loss.
         loss = optax.softmax_cross_entropy_with_integer_labels(
