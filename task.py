@@ -35,6 +35,31 @@ class Task:
     """MSB-first digits of the two operands -> the answer's digits, MSB-first."""
     raise NotImplementedError
 
+  def place_sums(self, a_digits: jnp.ndarray, b_digits: jnp.ndarray) -> jnp.ndarray:
+    """MSB-first operands -> LSB-first per-place sums before carrying (answer_length - 1 places;
+    the final answer digit is the last carry)."""
+    raise NotImplementedError
+
+  def max_place_sum(self, max_length1: int, max_length2: int) -> int:
+    """Upper bound of a place_sums entry, used to put auxiliary regression targets on unit scale."""
+    raise NotImplementedError
+
+  def running_sums(self, a_digits: jnp.ndarray, b_digits: jnp.ndarray):
+    """LSB-first (running sum, incoming carry) at every answer place.
+
+    running[k] = place_sums[k] + carry[k] and answer digit k is running[k] % 10, so these are the
+    intermediate quantities a model has to track to emit digit k without writing them out. They
+    serve as auxiliary (non-token) supervision targets."""
+
+    sums = jnp.concatenate((self.place_sums(a_digits, b_digits), jnp.zeros((1,), a_digits.dtype)))
+
+    def step(carry, s):
+      running = s + carry
+      return running // 10, (running, carry)
+
+    _, (running, carry) = jax.lax.scan(step, jnp.zeros((), a_digits.dtype), sums)
+    return running, carry
+
   def sample_inputs(self, max_length1: int, max_length2: int, batch_size: int, rng):
     rng1, rng2 = jax.random.split(rng)
     a = jax.random.randint(rng1, (batch_size, max_length1), 0, 10)
@@ -44,6 +69,30 @@ class Task:
   def episode_length(self, max_length1: int, max_length2: int) -> int:
     """Total token length of a generate_episode sequence: N1, op, N2, '=', answer digits, <EOS>."""
     return max_length1 + 1 + max_length2 + 1 + self.answer_length(max_length1, max_length2) + 1
+
+  def significance_ids(self, max_length1: int, max_length2: int, reverse_operands: bool = False,
+                       *, cot_steps: int = 0, causal: bool = True):
+    """Abacus-style id of every position of a generate_episode sequence (a tuple of ints).
+
+    An operand digit gets its significance (0 = units), whatever its token position; the answer
+    positions, from '=' to the last answer digit, get the significance of the digit they *predict*
+    (answer_length for the one predicting <EOS>); the op and <EOS> tokens share one extra id. So
+    a_i, b_i and the position emitting product digit i share an embedding.
+
+    CoT's '=' and <THINK> markers and thoughts use the extra id; causal answer
+    significance starts at <ANSWER>.
+    Diffusion instead embeds the digit being denoised at each answer position, since it
+    predicts that position's clean token rather than the next token, and has no EOS."""
+    n_answer = self.answer_length(max_length1, max_length2)
+    other = n_answer + 1
+    a = list(range(max_length1)) if reverse_operands else list(range(max_length1 - 1, -1, -1))
+    b = list(range(max_length2)) if reverse_operands else list(range(max_length2 - 1, -1, -1))
+    prefix = a + [other] + b
+    if cot_steps:
+      prefix += [other] * (cot_steps + 2)  # '=', <THINK>, thoughts
+    if causal:
+      return tuple(prefix + list(range(n_answer + 1)) + [other])
+    return tuple(prefix + [other] + list(range(n_answer)))
 
   def answer_start_index(self, max_length1: int, max_length2: int) -> int:
     """Index of the '=' token in a generate_episode sequence.
@@ -76,6 +125,15 @@ class AdditionTask(Task):
     carry, digits = jax.lax.scan(add_digits, 0, (a_digits, b_digits), reverse=True)
     return jnp.concatenate((carry[None], digits))
 
+  def place_sums(self, a_digits: jnp.ndarray, b_digits: jnp.ndarray) -> jnp.ndarray:
+    length = max(a_digits.shape[0], b_digits.shape[0])
+    a_digits = jnp.pad(a_digits, (length - a_digits.shape[0], 0))
+    b_digits = jnp.pad(b_digits, (length - b_digits.shape[0], 0))
+    return jnp.flip(a_digits + b_digits)
+
+  def max_place_sum(self, max_length1: int, max_length2: int) -> int:
+    return 18
+
 
 class MultiplicationTask(Task):
   name = 'multiply'
@@ -84,7 +142,7 @@ class MultiplicationTask(Task):
     # An L1-digit and L2-digit operand multiply to at most L1 + L2 digits.
     return max_length1 + max_length2
 
-  def compute(self, a_digits: jnp.ndarray, b_digits: jnp.ndarray) -> jnp.ndarray:
+  def place_sums(self, a_digits: jnp.ndarray, b_digits: jnp.ndarray) -> jnp.ndarray:
     a_lsb = jnp.flip(a_digits)
     b_lsb = jnp.flip(b_digits)
     length1 = a_digits.shape[0]
@@ -96,11 +154,17 @@ class MultiplicationTask(Task):
     # lowers to XLA's conv primitive and pulls in a cuDNN dependency this tiny sum doesn't need.
     # Each place's sum is at most min(length1, length2) * 81, well within range before carry
     # propagation.
-    products = jnp.stack([
+    return jnp.stack([
       sum(a_lsb[i] * b_lsb[k - i]
           for i in range(max(0, k - length2 + 1), min(k, length1 - 1) + 1))
       for k in range(length1 + length2 - 1)
     ])
+
+  def max_place_sum(self, max_length1: int, max_length2: int) -> int:
+    return 81 * min(max_length1, max_length2)
+
+  def compute(self, a_digits: jnp.ndarray, b_digits: jnp.ndarray) -> jnp.ndarray:
+    products = self.place_sums(a_digits, b_digits)
 
     def carry_digit(carry, x):
       total = x + carry
@@ -120,7 +184,8 @@ TASKS = {task.name: task for task in (AdditionTask, MultiplicationTask)}
 
 def generate_prompts(
     task: Task, max_length1: int, max_length2: int, batch_size: int, rng,
-    num_length1: int = None, num_length2: int = None, reverse_operands: bool = False):
+    num_length1: int = None, num_length2: int = None, reverse_operands: bool = False,
+    full_width_prob: float = 0.0, max_digit: int = 9, mix_full_size_prob: float = 0.0):
   """Samples an operand pair per row and renders the prompt 'N1 op N2 ='.
 
   When `num_length1` (resp. `num_length2`) is given, each row independently draws that operand's
@@ -134,21 +199,51 @@ def generate_prompts(
   keeps short problems in the mix. Training on a single size instead leaves the model with no
   gradient on the digit positions that stage never populates.
 
+  With `full_width_prob` > 0, that fraction of rows instead uses num_length1 and num_length2 digits
+  for both operands. Uniform sizes make the hardest (full-size) problems rare -- 1 in 25 rows for
+  5x5 -- although they are the ones the full-width validation measures.
+
   Rows are drawn at the full rendered width and the unused leading digits are then zeroed, which
   is the same distribution as drawing n digits and padding, but keeps the shape static under jit.
+
+  With `mix_full_size_prob` > 0, that fraction of rows ignores the num_length caps and draws its
+  sizes from 1..max_length1 / 1..max_length2, i.e. mixes rows of the final size range into an
+  earlier curriculum stage.
+
+  With `max_digit` < 9 (a digit-value curriculum), each row instead draws a cap uniformly from
+  1..max_digit and both operands' digits uniformly from 0..cap, so place sums and carries are
+  small; the default draws digits from 0..9 as the task does.
 
   Returns the prompts, the (a, b) operand digits and the MSB-first answer digits, so both the
   training and the validation builders share one layout."""
 
   rng, size_rng1, size_rng2 = jax.random.split(rng, 3)
   a, b = task.sample_inputs(max_length1, max_length2, batch_size, rng)
+  if max_digit < 9:
+    cap_rng, digit_rng1, digit_rng2 = jax.random.split(jax.random.fold_in(rng, 2), 3)
+    cap = jax.random.randint(cap_rng, (batch_size, 1), 1, max_digit + 1)
+    a = jax.random.randint(digit_rng1, (batch_size, max_length1), 0, cap + 1)
+    b = jax.random.randint(digit_rng2, (batch_size, max_length2), 0, cap + 1)
 
+  if full_width_prob > 0:
+    # fold_in, not split: split(rng) would reproduce the keys sample_inputs just used.
+    full_width = jax.random.bernoulli(jax.random.fold_in(rng, 1), full_width_prob, (batch_size,))
+  if mix_full_size_prob > 0:
+    mix_full = jax.random.bernoulli(jax.random.fold_in(rng, 3), mix_full_size_prob, (batch_size,))
   if num_length1 is not None:
     n1 = jax.random.randint(size_rng1, (batch_size,), 1, num_length1 + 1)
+    if full_width_prob > 0:
+      n1 = jnp.where(full_width, num_length1, n1)
+    if mix_full_size_prob > 0:
+      n1 = jnp.where(mix_full, jax.random.randint(jax.random.fold_in(size_rng1, 1), (batch_size,), 1, max_length1 + 1), n1)
     used1 = jnp.arange(max_length1)[None, :] >= (max_length1 - n1)[:, None]
     a = jnp.where(used1, a, 0)
   if num_length2 is not None:
     n2 = jax.random.randint(size_rng2, (batch_size,), 1, num_length2 + 1)
+    if full_width_prob > 0:
+      n2 = jnp.where(full_width, num_length2, n2)
+    if mix_full_size_prob > 0:
+      n2 = jnp.where(mix_full, jax.random.randint(jax.random.fold_in(size_rng2, 1), (batch_size,), 1, max_length2 + 1), n2)
     used2 = jnp.arange(max_length2)[None, :] >= (max_length2 - n2)[:, None]
     b = jnp.where(used2, b, 0)
 

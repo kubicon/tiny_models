@@ -311,7 +311,9 @@ def parse_args():
   parser.add_argument('--weight-decay', type=float, default=0.01)
   parser.add_argument('--batch-size', type=int, default=256)
   parser.add_argument('--num-steps', type=int, default=10000)
-  parser.add_argument('--num-length-schedule', nargs='+', default=None)
+  parser.add_argument('--num-length-schedule', nargs='+', default=None,
+                      help='Curriculum stages: N:ITERS, N1:N2:ITERS, or N1:N2:ITERS:D '
+                           'to cap digit values at D (1..9).')
   parser.add_argument('--steps-per-chunk', type=int, default=250)
   parser.add_argument('--num-samples', type=int, default=1000)
   parser.add_argument('--validation-seed', type=int, default=None)
@@ -370,7 +372,7 @@ def make_train_step(model, process, task, optimizer, width1, width2, batch_size,
                     cot_pg_weight=0.1, aux_loss_weight=0.1, cot_sampling_steps=None):
   """Build the optimizer step shared by the trainer and profiling tools."""
   make_prompts = jax.named_call(generate_prompts, name="data_generation")
-  def train_step(carry, step_key, n1, n2):
+  def train_step(carry, step_key, n1, n2, max_digit=9):
     params, state = carry
     if cot_steps:
       # Match the AR CoT trainer's operand RNG, independently of scratchpad draws.
@@ -379,7 +381,8 @@ def make_train_step(model, process, task, optimizer, width1, width2, batch_size,
       data_key = step_key
       noise_key = jax.random.fold_in(step_key, 101)
     batch_prompts, _, answers = make_prompts(task, width1, width2, batch_size, data_key,
-                                           n1, n2, reverse_operands=reverse_operands)
+                                           n1, n2, reverse_operands=reverse_operands,
+                                           max_digit=max_digit)
     if cot_steps:
       loss_fn = lambda p: cot_diffusion_loss(
         p, model, process, batch_prompts, jnp.flip(answers, axis=-1), noise_key, mask_token,
@@ -479,9 +482,9 @@ def main():
     return
 
   schedule = parse_num_length_schedule(args.num_length_schedule or [], width1, width2, args.num_steps)
-  if any(not (1 <= n1 <= width1 and 1 <= n2 <= width2) or steps < 1 for n1, n2, steps in schedule):
+  if any(not (1 <= n1 <= width1 and 1 <= n2 <= width2) or steps < 1 for n1, n2, steps, _ in schedule):
     raise ValueError('Curriculum widths must fit --sequence-length and stage steps must be positive')
-  total_steps = sum(steps for _, _, steps in schedule)
+  total_steps = sum(steps for _, _, steps, _ in schedule)
   hparams.update(num_length_schedule=schedule, total_steps=total_steps)
   if args.lr_schedule == 'constant':
     lr = optax.constant_schedule(args.learning_rate)
@@ -503,21 +506,21 @@ def main():
     args.reverse_operands, cot_steps, args.cot_samples, args.cot_pg_weight,
     args.aux_loss_weight, cot_sampling_steps)
 
-  @partial(jax.jit, static_argnames=('n1', 'n2', 'steps'), donate_argnums=(0,))
-  def train_chunk(carry, key, n1, n2, steps):
+  @partial(jax.jit, static_argnames=('n1', 'n2', 'max_digit', 'steps'), donate_argnums=(0,))
+  def train_chunk(carry, key, n1, n2, max_digit, steps):
     keys = jax.random.split(key, steps)
-    carry, metrics = jax.lax.scan(lambda c, k: train_step(c, k, n1, n2), carry, keys)
+    carry, metrics = jax.lax.scan(lambda c, k: train_step(c, k, n1, n2, max_digit), carry, keys)
     return carry, jax.tree_util.tree_map(jnp.mean, metrics)
 
   carry = (params, state)
   step, last_save = 0, 0
-  for n1, n2, stage_steps in schedule:
-    print(f'Training on num_length1={n1}, num_length2={n2} for {stage_steps} steps', flush=True)
+  for n1, n2, stage_steps, max_digit in schedule:
+    print(f'Training on num_length1={n1}, num_length2={n2} max_digit={max_digit} for {stage_steps} steps', flush=True)
     done = 0
     while done < stage_steps:
       count = min(args.steps_per_chunk, stage_steps - done)
       key, train_key = jax.random.split(key)
-      carry, metrics = train_chunk(carry, train_key, n1, n2, count)
+      carry, metrics = train_chunk(carry, train_key, n1, n2, max_digit, count)
       key, _ = jax.random.split(key)  # Same validation-key consumption as transformer.py.
       step += count
       done += count
