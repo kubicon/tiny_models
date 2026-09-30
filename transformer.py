@@ -12,7 +12,7 @@ import optax
 
 from task import (
   TASKS, answer_token_mask, digits_to_int, format_answer_tokens, generate_episode,
-  generate_validation_prompts,
+  generate_prompts, generate_validation_prompts,
 )
 
 
@@ -183,6 +183,41 @@ class MLP(nn.Module):
     return x
     
       
+class OneHotEmbed(nn.Embed):
+  """nn.Embed whose lookup is one_hot(ids) @ table instead of a gather. Same parameters, same values
+  (full fp32 precision keeps the selected rows exact). The backward pass of a gather is a
+  scatter-add, which on a GPU serialises when many lookups hit the same few rows: with a 13-token
+  vocabulary and batch 512 x 23 tokens it made the backward ~35x the forward. A dense matmul has
+  no collisions, and is only sensible for a small vocabulary."""
+
+  def __call__(self, inputs):
+    one_hot = jax.nn.one_hot(inputs, self.num_embeddings, dtype=self.embedding.dtype)
+    return jnp.dot(one_hot, self.embedding, precision=jax.lax.Precision.HIGHEST)
+
+
+def token_embedding(lookup: str, vocab_size: int, d_model: int):
+  if lookup not in ('gather', 'onehot'):
+    raise ValueError(f"Invalid embed_lookup: {lookup}")
+  return (OneHotEmbed if lookup == 'onehot' else nn.Embed)(vocab_size, d_model, name='tok_embed')
+
+
+def digit_position_embedding(digit_positions, seq_len: int, d_model: int):
+  """Learned embedding of each position's digit significance (see Task.significance_ids); zero
+  when digit_positions is empty. Must be called from inside a compact module."""
+  if not digit_positions:
+    return 0.0
+  ids = jnp.asarray(digit_positions[:seq_len], dtype=jnp.int32)
+  return nn.Embed(max(digit_positions) + 1, d_model, name='digit_pos_embed')(ids)
+
+
+def mtp_heads(x, mtp_tokens: int, vocab_size: int, normalization: str):
+  """(mtp_tokens - 1, seq, vocab) logits of the tokens 2, 3, ... positions ahead of each
+  position. Must be called from inside a compact module."""
+  x = Normalization(normalization, name='mtp_norm')(x)
+  return jnp.stack([nn.Dense(vocab_size, name=f'mtp_head_{ahead}')(x)
+                    for ahead in range(2, mtp_tokens + 1)])
+
+
 class Transformer(nn.Module):
   n_heads: int = 8
   d_model: int = 512
@@ -198,6 +233,18 @@ class Transformer(nn.Module):
   rope_base: float = 10000.0
   qk_norm: bool = False
   n_kv_heads: int = 0
+  # 'onehot' (dense one-hot matmul) or 'gather' (nn.Embed) token lookup; see OneHotEmbed.
+  embed_lookup: str = 'onehot'
+  # Width of a linear 'aux_probe' read out after every layer, sown as intermediates/aux (see
+  # model_outputs). 0 (the default) adds no probe, so older checkpoints have no such parameters.
+  aux_outputs: int = 0
+  # Per-position digit-significance ids (Task.significance_ids); non-empty adds a learned
+  # 'digit_pos_embed' of them on top of pos_embed.
+  digit_positions: Sequence[int] = ()
+  # Multi-token prediction: mtp_tokens - 1 extra linear heads on the output of layer mtp_readout
+  # predict the tokens 2, 3, ... ahead, sown as intermediates/mtp. 1 (the default) adds none.
+  mtp_tokens: int = 1
+  mtp_readout: int = -1
 
   @nn.compact
   def __call__(self, x, train: bool = False):
@@ -206,7 +253,7 @@ class Transformer(nn.Module):
 
     # Held as a module rather than called inline so the same table can be reused as the output
     # projection below (tied embeddings, as in the 777-parameter reference).
-    tok_embed = nn.Embed(self.vocab_size, self.d_model, name='tok_embed')
+    tok_embed = token_embedding(self.embed_lookup, self.vocab_size, self.d_model)
     x = tok_embed(x)
 
     if self.pos_embed == 'learned':
@@ -217,12 +264,14 @@ class Transformer(nn.Module):
     elif self.pos_embed != 'rope':
       # 'rope' adds nothing here; it rotates q/k inside every attention block instead.
       raise ValueError(f"Invalid pos_embed: {self.pos_embed}")
+    x = x + digit_position_embedding(self.digit_positions, seq_len, self.d_model)
 
 
     if self.recurrent_steps < 1:
       raise ValueError(f"recurrent_steps must be at least 1, got {self.recurrent_steps}")
 
-    for _ in range(self.n_layers):
+    aux_probe = nn.Dense(self.aux_outputs, name='aux_probe') if self.aux_outputs else None
+    for layer in range(self.n_layers):
       # Construct each block's modules once, then call those same module instances repeatedly.
       # Linen consequently reuses their parameters while the activation x is refined on every
       # recurrent step. With recurrent_steps=1 this is the original, ordinary Transformer block.
@@ -246,7 +295,11 @@ class Transformer(nn.Module):
         x = mlp_norm(x, train=train)
         x = mlp(x, train=train)
         x = x + residual
-      
+      if aux_probe is not None:
+        self.sow('intermediates', 'aux', aux_probe(x))
+      if self.mtp_tokens > 1 and layer == self.mtp_readout % self.n_layers:
+        self.sow('intermediates', 'mtp', mtp_heads(x, self.mtp_tokens, self.vocab_size, self.normalization))
+
     x = Normalization(self.normalization)(x, train=train)
     # Tied output projection: logits = x @ tok_embed.embedding.T, with no separate decoder matrix
     # and no output bias. Saves vocab_size * d_model params and is what the reference does.
@@ -279,6 +332,13 @@ class MemoryTransformer(nn.Module):
   rope_base: float = 10000.0
   qk_norm: bool = False
   n_kv_heads: int = 0
+  # 'onehot' (dense one-hot matmul) or 'gather' (nn.Embed) token lookup; see OneHotEmbed.
+  embed_lookup: str = 'onehot'
+  # Width of a linear 'aux_probe' read out of each pass's new memory, sown as intermediates/aux.
+  aux_outputs: int = 0
+  # As in Transformer; the multi-token heads read each pass's new memory.
+  digit_positions: Sequence[int] = ()
+  mtp_tokens: int = 1
 
   @nn.compact
   def __call__(self, tokens, memory, train: bool = False):
@@ -288,7 +348,7 @@ class MemoryTransformer(nn.Module):
       raise ValueError(f"memory_passes must be at least 1, got {self.memory_passes}")
 
     seq_len = tokens.shape[0]
-    tok_embed = nn.Embed(self.vocab_size, self.d_model, name='tok_embed')
+    tok_embed = token_embedding(self.embed_lookup, self.vocab_size, self.d_model)
     x = tok_embed(tokens)
     if memory.shape != x.shape:
       raise ValueError(f"memory must have shape {x.shape}, got {memory.shape}")
@@ -298,6 +358,7 @@ class MemoryTransformer(nn.Module):
       x = x + nn.Embed(self.max_seq_len, self.d_model, name='pos_embed')(positions)
     elif self.pos_embed != 'rope':
       raise ValueError(f"Invalid pos_embed: {self.pos_embed}")
+    x = x + digit_position_embedding(self.digit_positions, seq_len, self.d_model)
 
     # Reintroduce the input on every pass, while the recurrent state carries the computation.
     x = x + memory
@@ -322,6 +383,10 @@ class MemoryTransformer(nn.Module):
         x = mlp(x, train=train) + residual
 
     new_memory = x
+    if self.aux_outputs:
+      self.sow('intermediates', 'aux', nn.Dense(self.aux_outputs, name='aux_probe')(new_memory))
+    if self.mtp_tokens > 1:
+      self.sow('intermediates', 'mtp', mtp_heads(new_memory, self.mtp_tokens, self.vocab_size, self.normalization))
     logits = Normalization(self.normalization)(new_memory, train=train)
     return tok_embed.attend(logits), new_memory
 
@@ -339,9 +404,16 @@ def build_transformer(hparams):
     activation=hparams['activation'], normalization=hparams['normalization'],
     max_seq_len=hparams['max_seq_len'], pos_embed=hparams.get('pos_embed', 'learned'),
     rope_base=hparams.get('rope_base', 10000.0), qk_norm=hparams.get('qk_norm', False),
-    n_kv_heads=hparams.get('n_kv_heads', 0))
+    n_kv_heads=hparams.get('n_kv_heads', 0), embed_lookup=hparams.get('embed_lookup', 'onehot'),
+    aux_outputs=hparams.get('aux_outputs', 1 if hparams.get('aux_loss_weight', 0.0) > 0 else 0),
+    mtp_tokens=hparams.get('mtp_tokens', 1))
+  if hparams.get('digit_pos_embed', False):
+    kwargs['digit_positions'] = TASKS[hparams['task']]().significance_ids(
+      *hparams['sequence_length'], reverse_operands=hparams.get('reverse_operands', False))
   if model_type == 'memory':
     kwargs['memory_passes'] = hparams.get('memory_passes', 2)
+  else:
+    kwargs['mtp_readout'] = hparams.get('mtp_readout', -1)
   return model_class(**kwargs)
 
 
@@ -360,6 +432,44 @@ def model_logits(transformer, params, sequence: jnp.ndarray, train: bool = False
     logits, _ = transformer.apply(params, sequence, memory, train=train)
     return logits
   return transformer.apply(params, sequence, train=train)
+
+
+def model_outputs(transformer, params, sequence: jnp.ndarray, train: bool = False):
+  """Like model_logits, but also returns what the extra training losses need.
+
+  Returns (logits, pass_logits, aux, mtp):
+    pass_logits -- (memory_passes, seq, vocab) logits of every memory pass (the last one equals
+                   logits); None for the plain Transformer.
+    aux         -- (n_readouts, seq, aux_outputs) aux_probe outputs, one entry per layer (plain
+                   Transformer) or per memory pass (MemoryTransformer); None without an aux_probe.
+    mtp         -- (mtp_tokens - 1, seq, vocab) multi-token head logits (of the last memory pass);
+                   None without them.
+  """
+  has_aux, has_mtp = transformer.aux_outputs > 0, transformer.mtp_tokens > 1
+  seq_len = sequence.shape[0]
+  if isinstance(transformer, MemoryTransformer):
+    def one_pass(memory, _):
+      if has_aux or has_mtp:
+        (logits, new_memory), variables = transformer.apply(
+          params, sequence, memory, train=train, mutable=['intermediates'])
+        sown = variables['intermediates']
+      else:
+        logits, new_memory = transformer.apply(params, sequence, memory, train=train)
+        sown = {}
+      aux = sown['aux'][0] if has_aux else jnp.zeros((seq_len, 0))
+      mtp = sown['mtp'][0] if has_mtp else jnp.zeros((0, seq_len, 0))
+      return new_memory, (logits, aux, mtp)
+
+    memory = jnp.zeros((seq_len, transformer.d_model), dtype=jnp.float32)
+    _, (pass_logits, aux, mtp) = jax.lax.scan(one_pass, memory, None, length=transformer.memory_passes)
+    return (pass_logits[-1], pass_logits, aux if has_aux else None, mtp[-1] if has_mtp else None)
+
+  if has_aux or has_mtp:
+    logits, variables = transformer.apply(params, sequence, train=train, mutable=['intermediates'])
+    sown = variables['intermediates']
+    return (logits, None, jnp.stack(sown['aux']) if has_aux else None,
+            sown['mtp'][0] if has_mtp else None)
+  return transformer.apply(params, sequence, train=train), None, None, None
 
 
 def generate_tokens(transformer, params, prompts: jnp.ndarray, n_tokens: int):
@@ -389,27 +499,32 @@ def save_checkpoint(checkpoint_dir: str, step: int, params, opt_state, hparams: 
 
 
 def parse_num_length_schedule(schedule_args, default_length1: int, default_length2: int, default_steps: int):
-  """Parses ["N1:N2:ITERS", ...] into [(n1, n2, iters), ...]. "N:ITERS" is shorthand for
-  "N:N:ITERS" (same max size for both operands). Any remaining steps (default_steps minus the
-  sum of the given ITERS) are appended as a final (default_length1, default_length2, remaining)
-  entry, so the schedule doesn't need to spell out the final stage explicitly."""
+  """Parses ["N1:N2:ITERS", ...] into [(n1, n2, iters, max_digit), ...]. "N:ITERS" is shorthand
+  for "N:N:ITERS" (same max size for both operands); "N1:N2:ITERS:D" additionally caps digit
+  values (see generate_prompts' max_digit; 9, the default, means no cap). Any remaining steps
+  (default_steps minus the sum of the given ITERS) are appended as a final (default_length1,
+  default_length2, remaining, 9) entry, so the schedule doesn't need to spell out the final stage."""
 
   schedule = []
   for item in schedule_args:
     parts = item.split(':')
+    max_digit = 9
     if len(parts) == 2:
       size_str, iters_str = parts
       n1 = n2 = int(size_str)
-    elif len(parts) == 3:
-      n1_str, n2_str, iters_str = parts
-      n1, n2 = int(n1_str), int(n2_str)
+    elif len(parts) in (3, 4):
+      n1, n2, iters_str = int(parts[0]), int(parts[1]), parts[2]
+      if len(parts) == 4:
+        max_digit = int(parts[3])
     else:
-      raise ValueError(f"Invalid --num-length-schedule entry {item!r}, expected N:ITERS or N1:N2:ITERS")
-    schedule.append((n1, n2, int(iters_str)))
+      raise ValueError(f"Invalid --num-length-schedule entry {item!r}, expected N:ITERS, N1:N2:ITERS or N1:N2:ITERS:D")
+    if not 1 <= max_digit <= 9:
+      raise ValueError(f"Invalid digit cap in --num-length-schedule entry {item!r}, expected 1..9")
+    schedule.append((n1, n2, int(iters_str), max_digit))
 
-  remaining_steps = default_steps - sum(iters for _, _, iters in schedule)
+  remaining_steps = default_steps - sum(iters for _, _, iters, _ in schedule)
   if remaining_steps > 0:
-    schedule.append((default_length1, default_length2, remaining_steps))
+    schedule.append((default_length1, default_length2, remaining_steps, 9))
 
   return schedule
 
@@ -422,6 +537,43 @@ def parse_args():
   parser.add_argument('--memory-passes', type=int, default=2,
                        help="Number of passes over each sequence for --model-type memory. Only the "
                             "last pass predicts tokens; gradients flow through every pass.")
+  parser.add_argument('--deep-supervision', action='store_true', default=False,
+                       help="For --model-type memory: average the answer loss over the logits of every "
+                            "memory pass instead of scoring only the last pass.")
+  parser.add_argument('--aux-loss-weight', type=float, default=0.0,
+                       help="Weight of an auxiliary regression loss: a linear probe on an intermediate "
+                            "hidden state predicts, at every answer position, the running sum (or carry) "
+                            "behind the digit emitted there. No extra tokens are generated. 0 disables it.")
+  parser.add_argument('--aux-target', type=str, default='running_sum', choices=['running_sum', 'carry'],
+                       help="Auxiliary target at answer position k: 'running_sum' = place sum + incoming "
+                            "carry (digit k is its value mod 10), 'carry' = incoming carry only.")
+  parser.add_argument('--aux-loss-type', type=str, default='mse', choices=['mse', 'ce'],
+                       help="'mse' regresses the target scaled to unit range with a scalar probe; 'ce' "
+                            "classifies its exact integer value, which demands the precision a carry needs.")
+  parser.add_argument('--aux-readout', type=int, default=None,
+                       help="Which hidden state the auxiliary probe reads: the layer index for the plain "
+                            "Transformer, the memory pass index for --model-type memory (negative counts "
+                            "from the end). Defaults to the middle one.")
+  parser.add_argument('--mtp-tokens', type=int, default=1,
+                       help="Multi-token prediction: besides the next token, extra linear heads predict the "
+                            "answer tokens 2..K positions ahead (training only; generation uses the next-token "
+                            "head). Only answer tokens are targets, so this adds no algorithmic supervision. "
+                            "1 (the default) disables it.")
+  parser.add_argument('--mtp-weight', type=float, default=1.0,
+                       help="Weight of each extra multi-token head's loss relative to the next-token loss.")
+  parser.add_argument('--mtp-readout', type=int, default=-1,
+                       help="Plain Transformer: the layer whose output the multi-token heads read (negative "
+                            "counts from the end). The memory model always reads the last pass's memory.")
+  parser.add_argument('--digit-pos-embed', action='store_true', default=False,
+                       help="Add a learned Abacus-style embedding of each position's digit significance "
+                            "(operand digit i and the position emitting answer digit i share it), on top of "
+                            "--pos-embed.")
+  parser.add_argument('--resume', type=str, default=None,
+                       help="Checkpoint to continue from (params, optimizer state and step). The other "
+                            "arguments must describe the same run; training resumes at the saved step.")
+  parser.add_argument('--init-params', type=str, default=None,
+                       help="Start from this checkpoint's parameters, but with a fresh optimizer state, "
+                            "step count and LR schedule (unlike --resume).")
   parser.add_argument('--task', type=str, default='add', choices=sorted(TASKS),
                        help="Arithmetic task to train on. The task owns its symbols, so the vocabulary "
                             "size follows from it (10 digits, op, =, <EOS> -> 13) and is not configurable.")
@@ -432,10 +584,21 @@ def parse_args():
   parser.add_argument('--reverse-operands', action='store_true', default=False,
                        help="Render each operand LSB-first so its digit order agrees with the LSB-first answer. "
                             "The default keeps operands MSB-first.")
+  parser.add_argument('--full-width-prob', type=float, default=0.0,
+                       help="Fraction of training rows whose operands both use the current stage's maximum "
+                            "size instead of a size drawn uniformly from 1..N. 0 (the default) keeps "
+                            "uniform sizes, under which full-size problems are only 1/(N1*N2) of the data.")
+  parser.add_argument('--mix-full-size-prob', type=float, default=0.0,
+                       help="Fraction of training rows that ignore the curriculum stage's size caps and draw "
+                            "their operand sizes from 1..--sequence-length. 0 (the default) keeps the stages "
+                            "strictly to their caps.")
   parser.add_argument('--early-eos', action='store_true', default=False,
                        help="Emit <EOS> immediately after the most significant nonzero answer digit instead "
                             "of training on leading zero answer padding. Disabled by default.")
   parser.add_argument('--batch-size', type=int, default=512)
+  parser.add_argument('--embed-lookup', choices=['onehot', 'gather'], default='onehot',
+                       help="Token embedding lookup: 'onehot' (one-hot matmul, much faster backward on a GPU "
+                            "for a tiny vocabulary) or 'gather' (plain nn.Embed). Same parameters and function.")
   parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--d-model', type=int, default=7)
   parser.add_argument('--n-heads', type=int, default=1)
@@ -467,6 +630,11 @@ def parse_args():
   parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'muon'],
                        help="Optimizer to use. 'muon' orthogonalizes updates for 2D params (Newton-schulz) "
                             "and falls back to AdamW for the rest (embeddings, norms, biases).")
+  parser.add_argument('--muon-lr-mult', type=float, default=1.0,
+                       help="With --optimizer muon: any other value runs Muon on the hidden matrices at this "
+                            "multiple of the LR schedule and AdamW (with --weight-decay) on the embeddings "
+                            "and non-matrix params at the schedule itself. 1 (the default) keeps optax's "
+                            "defaults: Muon on every 2D param, one LR for both.")
   parser.add_argument('--num-steps', type=int, default=27000,
                        help="Total training steps. The default matches the 777-parameter reference's "
                             "2000 + 5000 + 20000 curriculum.")
@@ -504,6 +672,20 @@ def main():
   args = parse_args()
   if args.memory_passes < 1:
     raise ValueError(f"--memory-passes must be at least 1, got {args.memory_passes}")
+  if args.deep_supervision and args.model_type != 'memory':
+    raise ValueError("--deep-supervision requires --model-type memory")
+  n_readouts = args.memory_passes if args.model_type == 'memory' else args.n_layers
+  aux_readout = (n_readouts - 1) // 2 if args.aux_readout is None else args.aux_readout
+  if not -n_readouts <= aux_readout < n_readouts:
+    raise ValueError(f"--aux-readout {aux_readout} is out of range for {n_readouts} readouts")
+  aux_readout %= n_readouts
+  aux_outputs = 0
+  if args.aux_loss_weight > 0:
+    # Classes cover every value the target can take: a carry is at most max_place_sum / 9 and a
+    # running sum at most max_place_sum plus that carry.
+    max_place_sum = TASKS[args.task]().max_place_sum(*(args.sequence_length * 2)[:2])
+    max_value = max_place_sum // 9 + (max_place_sum if args.aux_target == 'running_sum' else 0)
+    aux_outputs = max_value + 1 if args.aux_loss_type == 'ce' else 1
   task = TASKS[args.task]()
   vocab_size = task.vocab_size
   if len(args.sequence_length) == 1:
@@ -516,6 +698,7 @@ def main():
   batch_size = args.batch_size
   reverse_operands = args.reverse_operands
   early_eos = args.early_eos
+  full_width_prob = args.full_width_prob
   seed = args.seed
   d_model = args.d_model
   n_heads = args.n_heads
@@ -541,7 +724,7 @@ def main():
     args.num_length_schedule, sequence_length1, sequence_length2, num_steps)
   # The curriculum is the authority on how many steps actually run (an explicit schedule may
   # overshoot --num-steps), so the LR decays over that horizon, not over --num-steps.
-  total_steps = sum(iters for _, _, iters in num_length_schedule)
+  total_steps = sum(iters for _, _, iters, _ in num_length_schedule)
   num_samples = args.num_samples
   checkpoint_dir = args.checkpoint_dir
   checkpoint_every = args.checkpoint_every
@@ -557,6 +740,8 @@ def main():
     'batch_size': batch_size,
     'reverse_operands': reverse_operands,
     'early_eos': early_eos,
+    'full_width_prob': full_width_prob,
+    'mix_full_size_prob': args.mix_full_size_prob,
     'seed': seed,
     'd_model': d_model,
     'n_heads': n_heads,
@@ -570,6 +755,7 @@ def main():
     'rope_base': rope_base,
     'qk_norm': qk_norm,
     'n_kv_heads': n_kv_heads,
+    'embed_lookup': args.embed_lookup,
     'learning_rate': learning_rate,
     'lr_schedule': lr_schedule_name,
     'warmup_steps': warmup_steps,
@@ -581,7 +767,21 @@ def main():
     'max_seq_len': task.episode_length(sequence_length1, sequence_length2),
     'num_length_schedule': num_length_schedule,
     'steps_per_chunk': steps_per_chunk,
+    'deep_supervision': args.deep_supervision,
+    'aux_loss_weight': args.aux_loss_weight,
+    'aux_target': args.aux_target,
+    'aux_loss_type': args.aux_loss_type,
+    'aux_readout': aux_readout,
+    'aux_outputs': aux_outputs,
+    'mtp_tokens': args.mtp_tokens,
+    'mtp_weight': args.mtp_weight,
+    'mtp_readout': args.mtp_readout,
+    'digit_pos_embed': args.digit_pos_embed,
+    'muon_lr_mult': args.muon_lr_mult,
+    'init_params': args.init_params,
   }
+  if args.mtp_tokens < 1:
+    raise ValueError(f"--mtp-tokens must be at least 1, got {args.mtp_tokens}")
 
   transformer = build_transformer(hparams)
 
@@ -627,64 +827,136 @@ def main():
   else:
     lr_schedule = optax.constant_schedule(learning_rate)
 
-  if optimizer_name == 'muon':
+  if optimizer_name == 'muon' and args.muon_lr_mult != 1.0:
+    # Muon for the hidden matrices at muon_lr_mult times the schedule; AdamW, at the schedule
+    # itself, for everything else including the (tied) embedding tables.
+    muon_lr_mult = args.muon_lr_mult
+    optimizer = optax.contrib.muon(
+      learning_rate=lambda step: muon_lr_mult * lr_schedule(step), adam_learning_rate=lr_schedule,
+      weight_decay=weight_decay, adam_weight_decay=weight_decay,
+      muon_weight_dimension_numbers=lambda params: jax.tree_util.tree_map_with_path(
+        lambda path, p: None if p.ndim != 2 or 'embed' in jax.tree_util.keystr(path)
+        else optax.contrib.MuonDimensionNumbers(), params))
+  elif optimizer_name == 'muon':
     optimizer = optax.contrib.muon(learning_rate=lr_schedule, weight_decay=weight_decay)
   else:
     optimizer = optax.adamw(learning_rate=lr_schedule, weight_decay=weight_decay)
   if grad_clip_norm > 0:
     optimizer = optax.chain(optax.clip_by_global_norm(grad_clip_norm), optimizer)
   state = optimizer.init(params)
-  
+
+  if args.init_params is not None:
+    with open(args.init_params, 'rb') as f:
+      init_params = pickle.load(f)['params']
+    if jax.tree_util.tree_structure(init_params) != jax.tree_util.tree_structure(params):
+      raise ValueError(f"{args.init_params} has different parameters than the model these arguments build")
+    params = init_params
+    state = optimizer.init(params)
+    print(f"Initialised parameters from {args.init_params}", flush=True)
+
+  start_step = 0
+  if args.resume is not None:
+    with open(args.resume, 'rb') as f:
+      checkpoint = pickle.load(f)
+    if jax.tree_util.tree_structure(checkpoint['params']) != jax.tree_util.tree_structure(params):
+      raise ValueError(f"{args.resume} has different parameters than the model these arguments build")
+    params, state, start_step = checkpoint['params'], checkpoint['opt_state'], checkpoint['step']
+    # Fresh data after the resume point rather than a replay of the first steps' batches.
+    rng_key = jax.random.fold_in(rng_key, start_step)
+    print(f"Resumed from {args.resume} at step {start_step}", flush=True)
+
   # Static: the answer span always begins at the same offset, so the loss is a compile-time
   # slice rather than a runtime mask.
   answer_start = task.answer_start_index(sequence_length1, sequence_length2)
+  deep_supervision = args.deep_supervision
+  aux_loss_weight = args.aux_loss_weight
+  aux_target = args.aux_target
+  aux_loss_type = args.aux_loss_type
+  aux_scale = float(task.max_place_sum(sequence_length1, sequence_length2))
+  mtp_tokens = args.mtp_tokens
+  mtp_weight = args.mtp_weight
 
-  def train_step(opt, rng_key, num_length1, num_length2):
+  def train_step(opt, rng_key, num_length1, num_length2, max_digit):
     """One optimizer step. Written as a lax.scan body (carry -> (carry, y)) so a whole chunk
     of steps can be fused into a single dispatch by train_chunk."""
 
-    batch = generate_episode(
+    # Same sampling as generate_episode, unrolled so the operands are available for aux targets.
+    prompts, (a, b), answer_digits = generate_prompts(
       task, sequence_length1, sequence_length2, batch_size, rng_key, num_length1, num_length2,
-      reverse_operands=reverse_operands, early_eos=early_eos)
+      reverse_operands=reverse_operands, full_width_prob=full_width_prob, max_digit=max_digit,
+      mix_full_size_prob=args.mix_full_size_prob)
+    batch = jnp.concatenate((prompts, format_answer_tokens(task, answer_digits, early_eos)), axis=-1)
+    running, carry = jax.vmap(task.running_sums)(a, b)
+    aux_targets = running if aux_target == 'running_sum' else carry
     params, state = opt
 
-    def loss_fn(params, sequences):
+    def loss_fn(params, sequences, aux_targets):
 
-      def loss_fn_single(sequence):
-        logits = model_logits(transformer, params, sequence, train=True)
+      def answer_loss(logits, sequence, ahead=1):
         # Score only the answer digits and <EOS>; the prompt targets (N1, N2) are uniform random
         # digits, so including them just dilutes the gradient and floors the reported loss.
+        # Position i predicts token i + ahead (ahead > 1: the multi-token heads).
+        targets = sequence[answer_start + ahead:]
         loss = optax.softmax_cross_entropy_with_integer_labels(
-          logits[answer_start:-1], sequence[answer_start + 1:])
+          logits[answer_start:sequence.shape[0] - ahead], targets)
         if early_eos:
-          mask = answer_token_mask(sequence[answer_start + 1:], task.eos_token)
-          return (loss * mask).sum() / mask.sum()
+          mask = answer_token_mask(targets, task.eos_token)
+          return (loss * mask).sum() / jnp.maximum(mask.sum(), 1)
         return loss.mean()
-      losses = jax.vmap(loss_fn_single)(sequences)
-      return losses.mean()
 
-    loss, grads = jax.value_and_grad(loss_fn)(params, batch)
+      def loss_fn_single(sequence, aux_values):
+        logits, pass_logits, aux, mtp = model_outputs(transformer, params, sequence, train=True)
+        loss = answer_loss(logits, sequence)
+        if deep_supervision:
+          train_loss = jax.vmap(answer_loss, in_axes=(0, None))(pass_logits, sequence).mean()
+        else:
+          train_loss = loss
+        if mtp_tokens > 1:
+          train_loss += mtp_weight * sum(
+            answer_loss(mtp[ahead - 2], sequence, ahead) for ahead in range(2, mtp_tokens + 1))
+        aux_loss = jnp.zeros(())
+        if aux_loss_weight > 0:
+          # Position answer_start + k emits answer digit k (LSB-first), so it is where the
+          # running sum behind that digit is needed.
+          prediction = aux[aux_readout, answer_start:answer_start + aux_values.shape[0]]
+          if aux_loss_type == 'ce':
+            aux_loss = optax.softmax_cross_entropy_with_integer_labels(prediction, aux_values).mean()
+          else:
+            aux_loss = jnp.mean((prediction[:, 0] - aux_values / aux_scale) ** 2)
+        return train_loss + aux_loss_weight * aux_loss, (loss, aux_loss)
+
+      total, (losses, aux_losses) = jax.vmap(loss_fn_single)(sequences, aux_targets)
+      return total.mean(), (losses.mean(), aux_losses.mean())
+
+    (_, (loss, aux_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch, aux_targets)
     grad_norm = optax.global_norm(grads)
     updates, state = optimizer.update(grads, state, params)
     params = optax.apply_updates(params, updates)
-    return (params, state), (loss, grad_norm)
+    return (params, state), (loss, grad_norm, aux_loss)
 
-  @partial(jax.jit, static_argnames=('num_length1', 'num_length2', 'n_steps'), donate_argnums=(0,))
-  def train_chunk(opt, rng_key, num_length1, num_length2, n_steps):
+  @partial(jax.jit, static_argnames=('num_length1', 'num_length2', 'max_digit', 'n_steps'), donate_argnums=(0,))
+  def train_chunk(opt, rng_key, num_length1, num_length2, max_digit, n_steps):
     """Runs n_steps training steps inside one jitted lax.scan. At this model size the per-step
     kernels are tiny, so fusing steps keeps the accelerator from being dispatch-bound; donating
     `opt` lets XLA update the params/optimizer buffers in place."""
 
     step_keys = jax.random.split(rng_key, n_steps)
-    opt, (losses, grad_norms) = jax.lax.scan(
-      lambda o, k: train_step(o, k, num_length1, num_length2), opt, step_keys)
-    return opt, losses.mean(), grad_norms.mean()
+    opt, (losses, grad_norms, aux_losses) = jax.lax.scan(
+      lambda o, k: train_step(o, k, num_length1, num_length2, max_digit), opt, step_keys)
+    return opt, losses.mean(), grad_norms.mean(), aux_losses.mean()
 
-  @jax.jit
-  def validate(params, rng_key):
-    prompts, target_digits, (a, b) = generate_validation_prompts(
-      task, sequence_length1, sequence_length2, num_samples, rng_key,
-      reverse_operands=reverse_operands)
+  @partial(jax.jit, static_argnames=('num_length1', 'num_length2'))
+  def validate(params, rng_key, num_length1=None, num_length2=None):
+    """Exact match on full-width operands, or (given num_lengths) on operands of exactly that
+    many digits in the same padded layout, which tracks a curriculum stage's own problem size."""
+    if num_length1 is None:
+      prompts, target_digits, (a, b) = generate_validation_prompts(
+        task, sequence_length1, sequence_length2, num_samples, rng_key,
+        reverse_operands=reverse_operands)
+    else:
+      prompts, (a, b), target_digits = generate_prompts(
+        task, sequence_length1, sequence_length2, num_samples, rng_key, num_length1, num_length2,
+        reverse_operands=reverse_operands, full_width_prob=1.0)
 
     n_output_digits = task.answer_length(sequence_length1, sequence_length2)
     n_output_tokens = n_output_digits + 1 if early_eos else n_output_digits
@@ -706,6 +978,8 @@ def main():
 
     return {
       'accuracy': jnp.mean(correct),
+      # LSB-first, i.e. in generation order.
+      'digit_accuracy': jnp.mean(jnp.flip(predicted_digits == target_digits, axis=-1), axis=0),
       'correct': correct,
       'n1': digits_to_int(a),
       'n2': digits_to_int(b),
@@ -715,24 +989,38 @@ def main():
 
   opt = (params, state)
 
-  i = 0
-  last_checkpoint_step = 0
-  for num_length1, num_length2, iters in num_length_schedule:
-    print(f"Training on num_length1={num_length1}, num_length2={num_length2} for {iters} steps", flush=True)
-    steps_done = 0
+  i = start_step
+  last_checkpoint_step = start_step
+  stage_start = 0
+  for num_length1, num_length2, iters, max_digit in num_length_schedule:
+    # When resuming, skip the stages (and the part of the current stage) already trained.
+    steps_done = min(iters, max(0, start_step - stage_start))
+    stage_start += iters
+    if steps_done == iters:
+      continue
+    print(f"Training on num_length1={num_length1}, num_length2={num_length2} max_digit={max_digit} for {iters - steps_done} steps", flush=True)
     while steps_done < iters:
       # A stage whose length is not a multiple of steps_per_chunk ends with one shorter chunk,
       # which costs one extra compilation for that stage.
       n_steps = min(steps_per_chunk, iters - steps_done)
       rng_key, train_key = jax.random.split(rng_key)
-      opt, loss, grad_norm = train_chunk(opt, train_key, num_length1, num_length2, n_steps)
+      opt, loss, grad_norm, aux_loss = train_chunk(opt, train_key, num_length1, num_length2, max_digit, n_steps)
       steps_done += n_steps
       i += n_steps
 
       rng_key, val_key = jax.random.split(rng_key)
       results = validate(opt[0], val_key)
       print(f"Step {i}, Loss (mean over last {n_steps} steps): {loss}, Grad norm (mean over last {n_steps} steps, pre-clip): {grad_norm}, LR: {float(lr_schedule(i - 1)):.3e}")
+      if aux_loss_weight > 0:
+        print(f"Aux loss (mean over last {n_steps} steps): {float(aux_loss):.3e}")
       print(f"Validation accuracy: {float(results['accuracy']) * 100:.2f}%", flush=True)
+      print("Digit accuracy (LSB first): "
+            + ' '.join(f'{float(x) * 100:.1f}' for x in results['digit_accuracy']), flush=True)
+      if (num_length1, num_length2) != (sequence_length1, sequence_length2):
+        rng_key, stage_key = jax.random.split(rng_key)
+        stage_results = validate(opt[0], stage_key, num_length1, num_length2)
+        print(f"Stage validation accuracy ({num_length1}x{num_length2} digits): "
+              f"{float(stage_results['accuracy']) * 100:.2f}%", flush=True)
 
       if checkpoint_dir is not None and i - last_checkpoint_step >= checkpoint_every:
         save_checkpoint(checkpoint_dir, i, opt[0], opt[1], hparams)

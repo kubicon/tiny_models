@@ -3,3 +3,5 @@ scripts/
 logs/
 *__pycache__*
 .venv/
+experiments/
+.vscode/
