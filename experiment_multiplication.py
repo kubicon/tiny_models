@@ -6,7 +6,11 @@ Run with the same Python environment used for transformer.py:
 
 The default sweep trains each model on 1x1, 2x1, and 2x2 digit problems. Each case uses a
 mixture of operand sizes up to its stated width. Runs with the same case and seed see the same
-training and validation examples. Results and full logs go into --output-dir; completed runs
+training and fixed validation examples. D3PM variants can be selected with --models d3pm-mask
+d3pm-uniform; their inference runs --sampling-steps denoiser calls (default --diffusion-steps).
+--cot-steps adds unsupervised scratchpads to either family. D3PM scratchpads use
+their own --cot-sampling-steps reverse calls before the answer chain.
+Results and full logs go into --output-dir; completed runs
 are skipped when the script is restarted with the same settings. Use --dry-run to list commands.
 """
 
@@ -29,20 +33,29 @@ MODELS = {
   'memory2': ('memory', 1, 2),
   'memory4': ('memory', 1, 4),
   'memory8': ('memory', 1, 8),
+  'd3pm-mask': ('d3pm', 1, 1),
+  'd3pm-uniform': ('d3pm', 1, 1),
 }
+DEFAULT_MODELS = ['plain', 'repeated4', 'memory2', 'memory4', 'memory8']
 PARAMS_RE = re.compile(r'^Trainable parameters: ([\d,]+)$')
 LOSS_RE = re.compile(r'^Step (\d+), Loss .*?: ([\d.eE+-]+),')
 ACCURACY_RE = re.compile(r'^Validation accuracy: ([\d.]+)%$')
+DIGIT_METRICS_RE = re.compile(r'^Digit accuracy: ([\d.]+)%, validation seconds: ([\d.]+)$')
 SUMMARY_FIELDS = (
   'case', 'model', 'seed', 'steps', 'block_calls', 'parameters', 'final_accuracy',
-  'best_accuracy', 'final_loss', 'seconds', 'log', 'checkpoint_dir')
+  'best_accuracy', 'final_loss', 'diffusion_steps', 'sampling_steps', 'digit_accuracy',
+  'validation_seconds', 'cot_steps', 'cot_samples', 'cot_sampling_steps',
+  'seconds', 'log', 'checkpoint_dir')
 
 
 def parse_args():
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   parser.add_argument('--output-dir', type=Path, default=Path('data/multiplication_experiment'))
   parser.add_argument('--cases', nargs='+', choices=CASES, default=list(CASES))
-  parser.add_argument('--models', nargs='+', choices=MODELS, default=list(MODELS))
+  parser.add_argument('--models', nargs='+', choices=MODELS, default=DEFAULT_MODELS)
+  parser.add_argument('--diffusion-steps', type=int, default=16)
+  parser.add_argument('--sampling-steps', type=int, default=None)
+  parser.add_argument('--aux-loss-weight', type=float, default=0.1)
   parser.add_argument('--seeds', nargs='+', type=int, default=[0],
                       help='Repeat each comparison with these seeds; e.g. --seeds 0 1 2.')
   parser.add_argument('--steps', nargs=3, type=int, default=[2000, 5000, 10000],
@@ -55,6 +68,12 @@ def parse_args():
   parser.add_argument('--hidden-dim', type=int, default=128)
   parser.add_argument('--learning-rate', type=float, default=0.003)
   parser.add_argument('--steps-per-chunk', type=int, default=250)
+  parser.add_argument('--cot-steps', type=int, default=0,
+                      help='Sample this many unsupervised digit thoughts before each answer.')
+  parser.add_argument('--cot-samples', type=int, default=2)
+  parser.add_argument('--cot-pg-weight', type=float, default=0.1)
+  parser.add_argument('--cot-sampling-steps', type=int, default=None,
+                      help='D3PM thought reverse steps; defaults to --diffusion-steps.')
   parser.add_argument('--dry-run', action='store_true', help='Print commands without training.')
   args = parser.parse_args()
   if any(n < 1 for n in args.steps):
@@ -63,6 +82,16 @@ def parse_args():
     parser.error('--d-model must be positive and divisible by --n-heads')
   if args.batch_size < 1 or args.num_samples < 1 or args.steps_per_chunk < 1:
     parser.error('batch size, validation samples, and steps per chunk must be positive')
+  if args.cot_steps < 0 or (args.cot_steps and args.cot_samples < 2):
+    parser.error('CoT requires --cot-steps >= 0 and --cot-samples >= 2')
+  if args.cot_pg_weight < 0:
+    parser.error('--cot-pg-weight must be nonnegative')
+  if args.diffusion_steps < 1 or args.aux_loss_weight < 0:
+    parser.error('diffusion steps must be positive and auxiliary loss weight nonnegative')
+  if args.sampling_steps is not None and not 1 <= args.sampling_steps <= args.diffusion_steps:
+    parser.error('sampling steps must be between 1 and diffusion steps')
+  if args.cot_sampling_steps is not None and not 1 <= args.cot_sampling_steps <= args.diffusion_steps:
+    parser.error('CoT sampling steps must be between 1 and diffusion steps')
   return args
 
 
@@ -71,7 +100,7 @@ def command_for(args, case, model, seed, checkpoint_dir):
   steps = dict(zip(CASES, args.steps))[case]
   model_type, recurrent_steps, memory_passes = MODELS[model]
   warmup_steps = min(200, steps // 10)
-  return [
+  command = [
     sys.executable, str(Path(__file__).with_name('transformer.py')),
     '--task', 'multiply', '--model-type', model_type,
     '--recurrent-steps', str(recurrent_steps), '--memory-passes', str(memory_passes),
@@ -83,9 +112,26 @@ def command_for(args, case, model, seed, checkpoint_dir):
     '--optimizer', 'adamw', '--learning-rate', str(args.learning_rate),
     '--lr-schedule', 'cosine', '--warmup-steps', str(warmup_steps),
     '--lr-min', str(args.learning_rate / 10),
-    '--seed', str(seed), '--steps-per-chunk', str(args.steps_per_chunk),
+    '--seed', str(seed), '--validation-seed', str(seed), '--steps-per-chunk', str(args.steps_per_chunk),
+    '--cot-steps', str(args.cot_steps), '--cot-samples', str(args.cot_samples),
+    '--cot-pg-weight', str(args.cot_pg_weight),
     '--checkpoint-dir', str(checkpoint_dir), '--checkpoint-every', str(steps + 1),
   ]
+  if model_type == 'd3pm':
+    command[1] = str(Path(__file__).with_name('d3pm.py'))
+    # The diffusion trainer shares arithmetic/model/optimizer flags but has its
+    # own generation process. CoT flags select diffusion scratchpads here.
+    for flag in ('--model-type', '--memory-passes'):
+      index = command.index(flag)
+      del command[index:index + 2]
+    command += ['--corruption', model.removeprefix('d3pm-'),
+                '--diffusion-steps', str(args.diffusion_steps),
+                '--aux-loss-weight', str(args.aux_loss_weight)]
+    if args.sampling_steps is not None:
+      command += ['--sampling-steps', str(args.sampling_steps)]
+    if args.cot_sampling_steps is not None:
+      command += ['--cot-sampling-steps', str(args.cot_sampling_steps)]
+  return command
 
 
 def read_metrics(log_path):
@@ -93,6 +139,7 @@ def read_metrics(log_path):
   losses = {}
   accuracies = []
   step = None
+  digit_metrics = {}
   with log_path.open() as log:
     for raw_line in log:
       line = raw_line.strip()
@@ -104,6 +151,9 @@ def read_metrics(log_path):
       elif match := ACCURACY_RE.match(line):
         if step is not None:
           accuracies.append((step, float(match.group(1)) / 100))
+      elif match := DIGIT_METRICS_RE.match(line):
+        digit_metrics = {'digit_accuracy': float(match.group(1)) / 100,
+                         'validation_seconds': float(match.group(2))}
   if parameters is None or not accuracies:
     raise ValueError(f'No completed training metrics found in {log_path}')
   final_step, final_accuracy = accuracies[-1]
@@ -112,6 +162,7 @@ def read_metrics(log_path):
     'final_accuracy': final_accuracy,
     'best_accuracy': max(accuracy for _, accuracy in accuracies),
     'final_loss': losses[final_step],
+    **digit_metrics,
   }
 
 
@@ -170,10 +221,16 @@ def main():
       if returncode:
         raise RuntimeError(f'{case} {model} seed={seed} failed; see {log_path}')
       steps = dict(zip(CASES, args.steps))[case]
-      _, recurrent_steps, memory_passes = MODELS[model]
+      model_type, recurrent_steps, memory_passes = MODELS[model]
       result = {
         'case': case, 'model': model, 'seed': seed, 'steps': steps,
         'block_calls': args.n_layers * recurrent_steps * memory_passes,
+        'diffusion_steps': args.diffusion_steps if model_type == 'd3pm' else None,
+        'sampling_steps': (args.sampling_steps or args.diffusion_steps) if model_type == 'd3pm' else None,
+        'cot_steps': args.cot_steps,
+        'cot_samples': args.cot_samples if args.cot_steps else None,
+        'cot_sampling_steps': ((args.cot_sampling_steps or args.diffusion_steps)
+                               if model_type == 'd3pm' and args.cot_steps else None),
         **read_metrics(log_path), 'seconds': round(time.monotonic() - start, 1),
         'log': str(log_path), 'checkpoint_dir': str(checkpoint_dir),
       }

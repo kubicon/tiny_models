@@ -80,6 +80,10 @@ def main():
   base_step = checkpoint['step']
   params = checkpoint['params']
   hparams = checkpoint['hparams']
+  if hparams.get('model_type') == 'd3pm':
+    raise ValueError('D3PM checkpoints use d3pm.py; autoregressive L-BFGS post-training is unsupported')
+  if hparams.get('cot_steps', 0):
+    raise ValueError('L-BFGS post-training does not support sampled CoT checkpoints')
 
   task, transformer = build_model(hparams)
   sequence_length1, sequence_length2 = hparams['sequence_length']

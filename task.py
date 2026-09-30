@@ -5,8 +5,8 @@ import jax.numpy as jnp
 class Task:
   """An arithmetic task: the symbols it uses and how one episode is laid out.
 
-  The token layout is shared by every task: 0-9 are digits, followed by the task's operator,
-  '=' and <EOS>, so `vocab_size` follows from the tokens rather than being configured.
+  The base token layout is shared by every task: 0-9 are digits, followed by the task's
+  operator, '=' and <EOS>. Optional CoT adds <THINK> and <ANSWER> after these base tokens.
   Subclasses supply the operator's meaning via `compute` and, where the task needs it, a
   different operand distribution via `sample_inputs`.
 
@@ -20,6 +20,8 @@ class Task:
   op_token = 10
   eq_token = 11
   eos_token = 12
+  think_token = 13
+  answer_token = 14
 
   @property
   def vocab_size(self) -> int:

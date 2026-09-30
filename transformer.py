@@ -11,7 +11,7 @@ from typing import Sequence
 import optax
 
 from task import (
-  TASKS, answer_token_mask, digits_to_int, format_answer_tokens, generate_episode,
+  TASKS, answer_token_mask, digits_to_int, format_answer_tokens, generate_episode, generate_prompts,
   generate_validation_prompts,
 )
 
@@ -52,6 +52,7 @@ class Attention(nn.Module):
   rope_base: float = 10000.0
   qk_norm: bool = False
   n_kv_heads: int = 0  # 0 means "same as n_heads", i.e. plain multi-head attention
+  causal: bool = True
   
   
   @nn.compact
@@ -111,8 +112,9 @@ class Attention(nn.Module):
     attention = jnp.einsum('ijk,ljk->ilj', q, k)
     attention = attention / jnp.sqrt(head_dim)
 
-    mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-    attention = jnp.where(mask[..., None] < 0.5, -jnp.inf, attention)
+    if self.causal:
+      mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+      attention = jnp.where(mask[..., None] < 0.5, -jnp.inf, attention)
     attention = jax.nn.softmax(attention, axis=1)
     # (query_pos, key_pos, head) weights, opt-in via mutable=['intermediates'] on apply();
     # a no-op otherwise, so it doesn't affect training.
@@ -198,9 +200,11 @@ class Transformer(nn.Module):
   rope_base: float = 10000.0
   qk_norm: bool = False
   n_kv_heads: int = 0
+  causal: bool = True
+  diffusion_steps: int = 0
 
   @nn.compact
-  def __call__(self, x, train: bool = False):
+  def __call__(self, x, train: bool = False, timestep=None):
 
     seq_len = x.shape[0]
 
@@ -208,6 +212,10 @@ class Transformer(nn.Module):
     # projection below (tied embeddings, as in the 777-parameter reference).
     tok_embed = nn.Embed(self.vocab_size, self.d_model, name='tok_embed')
     x = tok_embed(x)
+    if self.diffusion_steps:
+      if timestep is None:
+        raise ValueError('A diffusion denoiser requires a timestep')
+      x = x + nn.Embed(self.diffusion_steps + 1, self.d_model, name='time_embed')(timestep)
 
     if self.pos_embed == 'learned':
       # Fixed-size table sliced to seq_len, so params stay valid across calls with different lengths
@@ -230,7 +238,7 @@ class Transformer(nn.Module):
       attention = Attention(
         n_heads=self.n_heads, d_model=self.d_model, use_bias=self.use_bias,
         pos_embed=self.pos_embed, rope_base=self.rope_base,
-        qk_norm=self.qk_norm, n_kv_heads=self.n_kv_heads)
+        qk_norm=self.qk_norm, n_kv_heads=self.n_kv_heads, causal=self.causal)
       mlp_norm = Normalization(self.normalization)
       mlp = MLP(
         hidden_dims=self.hidden_dims, out_dim=self.d_model, activation=self.activation,
@@ -327,9 +335,9 @@ class MemoryTransformer(nn.Module):
 
 
 def build_transformer(hparams):
-  """Builds either model from checkpoint hyperparameters (including older checkpoints)."""
+  """Builds a model from checkpoint hyperparameters (including older checkpoints)."""
   model_type = hparams.get('model_type', 'transformer')
-  if model_type not in ('transformer', 'memory'):
+  if model_type not in ('transformer', 'memory', 'd3pm'):
     raise ValueError(f"Invalid model_type: {model_type}")
   model_class = MemoryTransformer if model_type == 'memory' else Transformer
   kwargs = dict(
@@ -342,6 +350,8 @@ def build_transformer(hparams):
     n_kv_heads=hparams.get('n_kv_heads', 0))
   if model_type == 'memory':
     kwargs['memory_passes'] = hparams.get('memory_passes', 2)
+  elif model_type == 'd3pm':
+    kwargs.update(causal=False, diffusion_steps=hparams['diffusion_steps'])
   return model_class(**kwargs)
 
 
@@ -351,6 +361,8 @@ def model_logits(transformer, params, sequence: jnp.ndarray, train: bool = False
   Gradients pass through every memory update during training. Generation starts from the same
   zero state for each growing prefix, so each prediction follows the training computation.
   """
+  if getattr(transformer, 'diffusion_steps', 0):
+    raise ValueError('Use d3pm.denoise_logits/generate_answers for diffusion models')
   if isinstance(transformer, MemoryTransformer):
     memory = jnp.zeros((sequence.shape[0], transformer.d_model), dtype=jnp.float32)
     def update_memory(_, state):
@@ -374,6 +386,36 @@ def generate_tokens(transformer, params, prompts: jnp.ndarray, n_tokens: int):
     sequences = jnp.concatenate((sequences, next_tokens[:, None]), axis=-1)
 
   return sequences[:, prompts.shape[1]:]
+
+
+def generate_thoughts(transformer, params, prompts, task, n_thought_tokens, rng_key=None):
+  """Append <THINK> and sample a fixed number of digit thoughts.
+
+  The padded suffix keeps shapes static inside scan. Causal attention prevents those padding
+  tokens from affecting the logits used to sample each thought. Passing no key uses greedy
+  decoding, useful for reproducible validation.
+  """
+  batch_size, prompt_length = prompts.shape
+  think = jnp.full((batch_size, 1), task.think_token, dtype=prompts.dtype)
+  padding = jnp.zeros((batch_size, n_thought_tokens), dtype=prompts.dtype)
+  sequence = jnp.concatenate((prompts, think, padding), axis=-1)
+  if rng_key is None:
+    rng_key = jax.random.key(0)
+    sample = False
+  else:
+    sample = True
+
+  def step(carry, offset):
+    sequence, key = carry
+    logits = jax.vmap(lambda row: model_logits(transformer, params, row))(sequence)
+    digit_logits = logits[:, prompt_length + offset, :10]
+    key, draw_key = jax.random.split(key)
+    token = jax.random.categorical(draw_key, digit_logits, axis=-1) if sample else jnp.argmax(digit_logits, axis=-1)
+    sequence = sequence.at[:, prompt_length + offset + 1].set(token)
+    return (sequence, key), None
+
+  (sequence, _), _ = jax.lax.scan(step, (sequence, rng_key), jnp.arange(n_thought_tokens))
+  return sequence
 
 
 def save_checkpoint(checkpoint_dir: str, step: int, params, opt_state, hparams: dict):
@@ -424,7 +466,7 @@ def parse_args():
                             "last pass predicts tokens; gradients flow through every pass.")
   parser.add_argument('--task', type=str, default='add', choices=sorted(TASKS),
                        help="Arithmetic task to train on. The task owns its symbols, so the vocabulary "
-                            "size follows from it (10 digits, op, =, <EOS> -> 13) and is not configurable.")
+                            "has 13 base tokens, or 15 with CoT enabled.")
   parser.add_argument('--sequence-length', type=int, nargs='+', default=[10],
                        help="Rendered digit width of the operands: one value sizes both operands, "
                             "two values (N1 N2) size the first and second operand independently, "
@@ -435,6 +477,14 @@ def parse_args():
   parser.add_argument('--early-eos', action='store_true', default=False,
                        help="Emit <EOS> immediately after the most significant nonzero answer digit instead "
                             "of training on leading zero answer padding. Disabled by default.")
+  parser.add_argument('--cot-steps', type=int, default=0,
+                      help="Number of sampled digit thought tokens before <ANSWER>. Zero disables CoT.")
+  parser.add_argument('--cot-samples', type=int, default=2,
+                      help="Independent thought samples per problem. CoT requires at least two to form "
+                           "a per-problem policy-gradient baseline; effective model batch size is "
+                           "--batch-size times --cot-samples.")
+  parser.add_argument('--cot-pg-weight', type=float, default=0.1,
+                      help="Weight of the thought-token policy-gradient loss relative to answer cross-entropy.")
   parser.add_argument('--batch-size', type=int, default=512)
   parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--d-model', type=int, default=7)
@@ -492,6 +542,8 @@ def parse_args():
   parser.add_argument('--weight-decay', type=float, default=1e-2,
                        help="Weight decay coefficient passed to the optimizer (AdamW or Muon).")
   parser.add_argument('--num-samples', type=int, default=1000)
+  parser.add_argument('--validation-seed', type=int, default=None,
+                       help='Use a fixed validation set from this seed at every checkpoint.')
   parser.add_argument('--checkpoint-dir', type=str, default="data/transformer_777", help="Folder to store checkpoints in. If not set, no checkpoints are saved.")
   parser.add_argument('--checkpoint-every', type=int, default=1000, help="Save a checkpoint every N steps.")
   parser.add_argument('--steps-per-chunk', type=int, default=250,
@@ -500,12 +552,99 @@ def parse_args():
                             "size on GPU) but coarsen the logging/validation granularity to this many steps.")
   return parser.parse_args() 
 
+def make_train_step(transformer, task, optimizer, sequence_length1, sequence_length2,
+                    batch_size, reverse_operands=False, early_eos=False, cot_steps=0,
+                    cot_samples=2, cot_pg_weight=0.1):
+  """Build the optimizer step shared by the trainer and profiling tools."""
+  # The answer offset is static, making loss slices compile-time constants.
+  answer_start = task.answer_start_index(sequence_length1, sequence_length2)
+  make_prompts = jax.named_call(generate_prompts, name="data_generation")
+  make_episode = jax.named_call(generate_episode, name="data_generation")
+  sample_thoughts = jax.named_call(generate_thoughts, name="thought_generation")
+
+  def train_step(opt, rng_key, num_length1, num_length2):
+    """One optimizer step. Written as a lax.scan body (carry -> (carry, y)) so a whole chunk
+    of steps can be fused into a single dispatch by train_chunk."""
+
+    params, state = opt
+    if cot_steps:
+      data_key, thought_key = jax.random.split(rng_key)
+      prompts, _, answer_digits = make_prompts(
+        task, sequence_length1, sequence_length2, batch_size, data_key,
+        num_length1, num_length2, reverse_operands=reverse_operands)
+      answer_tokens = format_answer_tokens(task, answer_digits, early_eos)
+      prompts = jnp.repeat(prompts, cot_samples, axis=0)
+      answer_tokens = jnp.repeat(answer_tokens, cot_samples, axis=0)
+      thought_prefix = sample_thoughts(
+        transformer, params, prompts, task, cot_steps, thought_key)
+      answer_marker = jnp.full((batch_size * cot_samples, 1), task.answer_token)
+      batch = jnp.concatenate((thought_prefix, answer_marker, answer_tokens), axis=-1)
+      answer_marker_index = answer_start + 1 + cot_steps + 1
+      thought_start = answer_start + 2
+
+      def loss_fn(params, sequences):
+        def loss_fn_single(sequence):
+          logits = model_logits(transformer, params, sequence, train=True)
+          answer_targets = sequence[answer_marker_index + 1:]
+          answer_loss = optax.softmax_cross_entropy_with_integer_labels(
+            logits[answer_marker_index:-1], answer_targets)
+          if early_eos:
+            mask = answer_token_mask(answer_targets, task.eos_token)
+            answer_loss = (answer_loss * mask).sum() / mask.sum()
+          else:
+            answer_loss = answer_loss.mean()
+          thought_logprobs = jax.nn.log_softmax(
+            logits[thought_start - 1:thought_start + cot_steps - 1, :10], axis=-1)
+          thought_tokens = sequence[thought_start:thought_start + cot_steps]
+          logprob = jnp.take_along_axis(
+            thought_logprobs, thought_tokens[:, None], axis=-1).sum()
+          return answer_loss, logprob
+
+        answer_losses, thought_logprobs = jax.vmap(loss_fn_single)(sequences)
+        grouped_losses = answer_losses.reshape(batch_size, cot_samples)
+        other_mean = (grouped_losses.sum(axis=1, keepdims=True) - grouped_losses) / (cot_samples - 1)
+        advantage = jax.lax.stop_gradient(other_mean - grouped_losses).reshape(-1)
+        policy_loss = -(advantage * thought_logprobs).mean()
+        return answer_losses.mean() + cot_pg_weight * policy_loss
+
+    else:
+      batch = make_episode(
+        task, sequence_length1, sequence_length2, batch_size, rng_key, num_length1, num_length2,
+        reverse_operands=reverse_operands, early_eos=early_eos)
+
+      def loss_fn(params, sequences):
+        def loss_fn_single(sequence):
+          logits = model_logits(transformer, params, sequence, train=True)
+          # Score only answer digits and <EOS>, never the random operand targets.
+          loss = optax.softmax_cross_entropy_with_integer_labels(
+            logits[answer_start:-1], sequence[answer_start + 1:])
+          if early_eos:
+            mask = answer_token_mask(sequence[answer_start + 1:], task.eos_token)
+            return (loss * mask).sum() / mask.sum()
+          return loss.mean()
+        return jax.vmap(loss_fn_single)(sequences).mean()
+
+    with jax.named_scope("loss_and_gradients"):
+      loss, grads = jax.value_and_grad(loss_fn)(params, batch)
+    grad_norm = optax.global_norm(grads)
+    with jax.named_scope("optimizer_update"):
+      updates, state = optimizer.update(grads, state, params)
+    params = optax.apply_updates(params, updates)
+    return (params, state), (loss, grad_norm)
+
+  return jax.named_call(train_step, name="train_step")
+
+
 def main():
   args = parse_args()
+  if args.cot_steps < 0 or (args.cot_steps and args.cot_samples < 2):
+    raise ValueError("--cot-steps must be nonnegative, and CoT requires --cot-samples >= 2")
+  if args.cot_pg_weight < 0:
+    raise ValueError("--cot-pg-weight must be nonnegative")
   if args.memory_passes < 1:
     raise ValueError(f"--memory-passes must be at least 1, got {args.memory_passes}")
   task = TASKS[args.task]()
-  vocab_size = task.vocab_size
+  vocab_size = task.vocab_size + (2 if args.cot_steps else 0)
   if len(args.sequence_length) == 1:
     sequence_length1 = sequence_length2 = args.sequence_length[0]
   elif len(args.sequence_length) == 2:
@@ -516,6 +655,9 @@ def main():
   batch_size = args.batch_size
   reverse_operands = args.reverse_operands
   early_eos = args.early_eos
+  cot_steps = args.cot_steps
+  cot_samples = args.cot_samples
+  cot_pg_weight = args.cot_pg_weight
   seed = args.seed
   d_model = args.d_model
   n_heads = args.n_heads
@@ -557,7 +699,11 @@ def main():
     'batch_size': batch_size,
     'reverse_operands': reverse_operands,
     'early_eos': early_eos,
+    'cot_steps': cot_steps,
+    'cot_samples': cot_samples,
+    'cot_pg_weight': cot_pg_weight,
     'seed': seed,
+    'validation_seed': args.validation_seed,
     'd_model': d_model,
     'n_heads': n_heads,
     'n_layers': n_layers,
@@ -578,7 +724,8 @@ def main():
     'weight_decay': weight_decay,
     'optimizer': optimizer_name,
     'total_steps': total_steps,
-    'max_seq_len': task.episode_length(sequence_length1, sequence_length2),
+    'max_seq_len': task.episode_length(sequence_length1, sequence_length2) +
+                   (cot_steps + 2 if cot_steps else 0),
     'num_length_schedule': num_length_schedule,
     'steps_per_chunk': steps_per_chunk,
   }
@@ -590,6 +737,12 @@ def main():
   example_sequence = generate_episode(
     task, sequence_length1, sequence_length2, 1, example_key,
     reverse_operands=reverse_operands, early_eos=early_eos)[0]
+  if cot_steps:
+    prompt_end = task.answer_start_index(sequence_length1, sequence_length2) + 1
+    example_sequence = jnp.concatenate((
+      example_sequence[:prompt_end], jnp.array([task.think_token]),
+      jnp.zeros((cot_steps,), dtype=example_sequence.dtype),
+      jnp.array([task.answer_token]), example_sequence[prompt_end:]))
   rng_key, init_key = jax.random.split(rng_key)
   if isinstance(transformer, MemoryTransformer):
     example_memory = jnp.zeros((example_sequence.shape[0], d_model), dtype=jnp.float32)
@@ -635,39 +788,9 @@ def main():
     optimizer = optax.chain(optax.clip_by_global_norm(grad_clip_norm), optimizer)
   state = optimizer.init(params)
   
-  # Static: the answer span always begins at the same offset, so the loss is a compile-time
-  # slice rather than a runtime mask.
-  answer_start = task.answer_start_index(sequence_length1, sequence_length2)
-
-  def train_step(opt, rng_key, num_length1, num_length2):
-    """One optimizer step. Written as a lax.scan body (carry -> (carry, y)) so a whole chunk
-    of steps can be fused into a single dispatch by train_chunk."""
-
-    batch = generate_episode(
-      task, sequence_length1, sequence_length2, batch_size, rng_key, num_length1, num_length2,
-      reverse_operands=reverse_operands, early_eos=early_eos)
-    params, state = opt
-
-    def loss_fn(params, sequences):
-
-      def loss_fn_single(sequence):
-        logits = model_logits(transformer, params, sequence, train=True)
-        # Score only the answer digits and <EOS>; the prompt targets (N1, N2) are uniform random
-        # digits, so including them just dilutes the gradient and floors the reported loss.
-        loss = optax.softmax_cross_entropy_with_integer_labels(
-          logits[answer_start:-1], sequence[answer_start + 1:])
-        if early_eos:
-          mask = answer_token_mask(sequence[answer_start + 1:], task.eos_token)
-          return (loss * mask).sum() / mask.sum()
-        return loss.mean()
-      losses = jax.vmap(loss_fn_single)(sequences)
-      return losses.mean()
-
-    loss, grads = jax.value_and_grad(loss_fn)(params, batch)
-    grad_norm = optax.global_norm(grads)
-    updates, state = optimizer.update(grads, state, params)
-    params = optax.apply_updates(params, updates)
-    return (params, state), (loss, grad_norm)
+  train_step = make_train_step(
+    transformer, task, optimizer, sequence_length1, sequence_length2, batch_size,
+    reverse_operands, early_eos, cot_steps, cot_samples, cot_pg_weight)
 
   @partial(jax.jit, static_argnames=('num_length1', 'num_length2', 'n_steps'), donate_argnums=(0,))
   def train_chunk(opt, rng_key, num_length1, num_length2, n_steps):
@@ -682,9 +805,16 @@ def main():
 
   @jax.jit
   def validate(params, rng_key):
+    if args.validation_seed is not None:
+      rng_key = jax.random.key(args.validation_seed)
     prompts, target_digits, (a, b) = generate_validation_prompts(
       task, sequence_length1, sequence_length2, num_samples, rng_key,
       reverse_operands=reverse_operands)
+
+    if cot_steps:
+      thought_prefix = generate_thoughts(transformer, params, prompts, task, cot_steps)
+      answer_marker = jnp.full((num_samples, 1), task.answer_token)
+      prompts = jnp.concatenate((thought_prefix, answer_marker), axis=-1)
 
     n_output_digits = task.answer_length(sequence_length1, sequence_length2)
     n_output_tokens = n_output_digits + 1 if early_eos else n_output_digits
