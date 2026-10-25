@@ -106,6 +106,20 @@ class D3PM:
     normalizer = weights.sum(axis=-1, keepdims=True)
     return weights / jnp.where(normalizer > 0, normalizer, 1)
 
+  def log_posterior(self, clean_probs, noisy, s, t):
+    """log(posterior()) as log(weights) - log(normalizer), for differentiating trajectory scores.
+
+    The gradient of log(weights / normalizer) contains weights / normalizer**2. At an already
+    unmasked digit the model finds unlikely, the normalizer can be ~1e-20, its square underflows,
+    and the gradient becomes inf - inf = NaN (the true gradient there is zero: the posterior is
+    one-hot). This form only divides by normalizer and weights, so it stays finite.
+    """
+    prior_at_s = clean_probs @ self.q_bar(s)
+    likelihood = jnp.moveaxis(self.transition(s, t)[:, noisy], 0, -1)
+    weights = prior_at_s * likelihood
+    normalizer = weights.sum(axis=-1, keepdims=True)
+    return log_probs(weights) - jnp.log(jnp.where(normalizer > 0, normalizer, 1))
+
   def clean_probs(self, digit_logits):
     probs = jax.nn.softmax(digit_logits, axis=-1)
     # Keep every clean category possible even if softmax underflows. Otherwise
@@ -189,12 +203,14 @@ def generate_answers(model, params, process, prompts, answer_length, key, mask_t
     t, s = pair
     logits = denoise_logits(model, params, process, prompts, noisy,
                             jnp.full((prompts.shape[0],), t), mask_token)
-    p = process.posterior(process.clean_probs(logits), noisy, s, t)
+    clean_probs = process.clean_probs(logits)
+    p = process.posterior(clean_probs, noisy, s, t)
     key, draw_key = jax.random.split(key)
     sampled = jax.random.categorical(draw_key, log_probs(p)).astype(jnp.int32)
     next_answer = sampled if sample_final else jnp.where(s == 0, jnp.argmax(p, axis=-1), sampled)
     if return_logprob:
-      score = jnp.take_along_axis(log_probs(p), next_answer[..., None], axis=-1)[..., 0].sum(axis=-1)
+      log_p = process.log_posterior(clean_probs, noisy, s, t)
+      score = jnp.take_along_axis(log_p, next_answer[..., None], axis=-1)[..., 0].sum(axis=-1)
       return (next_answer, key), (next_answer, score)
     return (next_answer, key), next_answer
 
@@ -272,7 +288,7 @@ def cot_diffusion_loss(params, model, process, prompts, clean, key, mask_token, 
   }
 
 
-def parse_args():
+def parse_args(argv=None):
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument('--task', choices=sorted(TASKS), default='multiply')
   parser.add_argument('--sequence-length', type=int, nargs='+', default=[2, 2])
@@ -323,7 +339,10 @@ def parse_args():
                       help='Defaults to data/d3pm_<task>_<corruption>.')
   parser.add_argument('--checkpoint-every', type=int, default=1000)
   parser.add_argument('--checkpoint', type=Path, help='Evaluate a saved D3PM checkpoint; no training.')
-  args = parser.parse_args()
+  parser.add_argument('--resume', type=Path, default=None,
+                      help='Continue training from this checkpoint (params, optimizer state and step); the '
+                           'other arguments must describe the same run.')
+  args = parser.parse_args(argv)
   if len(args.sequence_length) not in (1, 2) or min(args.sequence_length) < 1:
     parser.error('--sequence-length requires one or two positive widths')
   if len(args.sequence_length) == 1:
@@ -372,8 +391,8 @@ def make_train_step(model, process, task, optimizer, width1, width2, batch_size,
                     cot_pg_weight=0.1, aux_loss_weight=0.1, cot_sampling_steps=None):
   """Build the optimizer step shared by the trainer and profiling tools."""
   make_prompts = jax.named_call(generate_prompts, name="data_generation")
-  def train_step(carry, step_key, n1, n2, max_digit=9):
-    params, state = carry
+  def make_batch(params, step_key, n1, n2, max_digit=9):
+    """One step's problems (LSB-first answers) and diffusion-noise key; params are unused."""
     if cot_steps:
       # Match the AR CoT trainer's operand RNG, independently of scratchpad draws.
       data_key, noise_key = jax.random.split(step_key)
@@ -383,25 +402,36 @@ def make_train_step(model, process, task, optimizer, width1, width2, batch_size,
     batch_prompts, _, answers = make_prompts(task, width1, width2, batch_size, data_key,
                                            n1, n2, reverse_operands=reverse_operands,
                                            max_digit=max_digit)
+    return batch_prompts, jnp.flip(answers, axis=-1), noise_key
+
+  def loss_fn(params, batch):
+    prompts, clean, noise_key = batch
     if cot_steps:
-      loss_fn = lambda p: cot_diffusion_loss(
-        p, model, process, batch_prompts, jnp.flip(answers, axis=-1), noise_key, mask_token,
-        task, cot_steps, cot_samples, cot_pg_weight, aux_loss_weight,
-        cot_sampling_steps)
-    else:
-      loss_fn = lambda p: diffusion_loss(p, model, process, batch_prompts, jnp.flip(answers, axis=-1),
-                                         noise_key, mask_token, aux_loss_weight)
+      return cot_diffusion_loss(params, model, process, prompts, clean, noise_key, mask_token,
+                                task, cot_steps, cot_samples, cot_pg_weight, aux_loss_weight,
+                                cot_sampling_steps)
+    return diffusion_loss(params, model, process, prompts, clean, noise_key, mask_token,
+                          aux_loss_weight)
+
+  def train_step(carry, step_key, n1, n2, max_digit=9):
+    params, state = carry
+    batch = make_batch(params, step_key, n1, n2, max_digit)
     with jax.named_scope("loss_and_gradients"):
-      (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+      (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch)
     with jax.named_scope("optimizer_update"):
       updates, state = optimizer.update(grads, state, params)
     return (optax.apply_updates(params, updates), state), {'loss': loss, **metrics}
 
-  return jax.named_call(train_step, name="train_step")
+  step = jax.named_call(train_step, name="train_step")
+  # The step's stages, which profile_algorithms.py times separately.
+  step.make_batch, step.loss_fn = make_batch, loss_fn
+  return step
 
 
-def main():
-  args = parse_args()
+def build_training(args):
+  """Everything main() evaluates and trains with, built from parsed arguments: the model,
+  params, optimizer state, the jitted train_chunk and validate, and the curriculum. Shared with
+  profile_algorithms.py so that profiling measures exactly what training runs."""
   if args.checkpoint:
     checkpoint = load_checkpoint(args.checkpoint)
     hparams, params = checkpoint['hparams'], checkpoint['params']
@@ -470,16 +500,6 @@ def main():
       example_prompts = thought_prefix(example_prompts, jnp.zeros((1, cot_steps), dtype=jnp.int32), task)
     example = jnp.concatenate((example_prompts[0], jnp.zeros((answer_length,), dtype=jnp.int32)))
     params = model.init(init_key, example, timestep=jnp.array(process.num_steps))
-  print(f'Trainable parameters: {sum(p.size for p in jax.tree_util.tree_leaves(params)):,}', flush=True)
-  accuracy, digit_accuracy = validate(params)
-  print(f'Initial validation accuracy: {float(accuracy):.2%}, digit accuracy: {float(digit_accuracy):.2%}', flush=True)
-  if args.checkpoint:
-    start = time.monotonic()
-    accuracy, digit_accuracy = validate(params)
-    accuracy.block_until_ready()
-    print(f'Validation accuracy: {float(accuracy):.2%}')
-    print(f'Digit accuracy: {float(digit_accuracy):.2%}, validation seconds: {time.monotonic() - start:.3f}')
-    return
 
   schedule = parse_num_length_schedule(args.num_length_schedule or [], width1, width2, args.num_steps)
   if any(not (1 <= n1 <= width1 and 1 <= n2 <= width2) or steps < 1 for n1, n2, steps, _ in schedule):
@@ -500,6 +520,16 @@ def main():
   if args.grad_clip_norm > 0:
     optimizer = optax.chain(optax.clip_by_global_norm(args.grad_clip_norm), optimizer)
   state = optimizer.init(params)
+  start_step = 0
+  if args.resume is not None:
+    with args.resume.open('rb') as file:
+      checkpoint = pickle.load(file)
+    if jax.tree_util.tree_structure(checkpoint['params']) != jax.tree_util.tree_structure(params):
+      raise ValueError(f'{args.resume} has different parameters than the model these arguments build')
+    params, state, start_step = checkpoint['params'], checkpoint['opt_state'], checkpoint['step']
+    # Fresh data after the resume point rather than a replay of the first steps' batches.
+    key = jax.random.fold_in(key, start_step)
+    print(f'Resumed from {args.resume} at step {start_step}', flush=True)
 
   train_step = make_train_step(
     model, process, task, optimizer, width1, width2, args.batch_size, mask_token,
@@ -512,26 +542,64 @@ def main():
     carry, metrics = jax.lax.scan(lambda c, k: train_step(c, k, n1, n2, max_digit), carry, keys)
     return carry, jax.tree_util.tree_map(jnp.mean, metrics)
 
-  carry = (params, state)
-  step, last_save = 0, 0
-  for n1, n2, stage_steps, max_digit in schedule:
-    print(f'Training on num_length1={n1}, num_length2={n2} max_digit={max_digit} for {stage_steps} steps', flush=True)
-    done = 0
+  return argparse.Namespace(
+    task=task, hparams=hparams, model=model, process=process, optimizer=optimizer,
+    train_step=train_step, train_chunk=train_chunk, validate=validate, opt=(params, state),
+    rng_key=key, start_step=start_step, num_length_schedule=schedule, steps_per_chunk=args.steps_per_chunk,
+    sequence_length=(width1, width2))
+
+
+def main():
+  args = parse_args()
+  run = build_training(args)
+  params, validate, train_chunk, key = run.opt[0], run.validate, run.train_chunk, run.rng_key
+  hparams, cot_steps = run.hparams, run.hparams.get('cot_steps', 0)
+  print(f'Trainable parameters: {sum(p.size for p in jax.tree_util.tree_leaves(params)):,}', flush=True)
+  accuracy, digit_accuracy = validate(params)
+  print(f'Initial validation accuracy: {float(accuracy):.2%}, digit accuracy: {float(digit_accuracy):.2%}', flush=True)
+  if args.checkpoint:
+    start = time.monotonic()
+    accuracy, digit_accuracy = validate(params)
+    accuracy.block_until_ready()
+    print(f'Validation accuracy: {float(accuracy):.2%}')
+    print(f'Digit accuracy: {float(digit_accuracy):.2%}, validation seconds: {time.monotonic() - start:.3f}')
+    return
+
+  carry = run.opt
+  step = last_save = run.start_step
+  stage_start = 0
+  run_start = time.monotonic()
+  for n1, n2, stage_steps, max_digit in run.num_length_schedule:
+    # When resuming, skip the stages (and the part of the current stage) already trained.
+    done = min(stage_steps, max(0, run.start_step - stage_start))
+    stage_start += stage_steps
+    if done == stage_steps:
+      continue
+    print(f'Training on num_length1={n1}, num_length2={n2} max_digit={max_digit} for {stage_steps - done} steps', flush=True)
     while done < stage_steps:
       count = min(args.steps_per_chunk, stage_steps - done)
       key, train_key = jax.random.split(key)
+      chunk_start = time.monotonic()
       carry, metrics = train_chunk(carry, train_key, n1, n2, max_digit, count)
+      jax.block_until_ready(carry)
+      train_seconds = time.monotonic() - chunk_start
       key, _ = jax.random.split(key)  # Same validation-key consumption as transformer.py.
       step += count
       done += count
       start = time.monotonic()
       accuracy, digit_accuracy = validate(carry[0])
       accuracy.block_until_ready()
+      validation_seconds = time.monotonic() - start
+      log_start = time.monotonic()
       print(f'Step {step}, Loss (mean over last {count} steps): {float(metrics["loss"])}, VB: {float(metrics["vb"])}, auxiliary CE: {float(metrics["auxiliary"])}')
       if cot_steps:
         print(f'Answer loss: {float(metrics["answer_loss"])}, CoT policy loss: {float(metrics["cot_policy"])}, thought trajectory logprob: {float(metrics["thought_logprob"])}')
       print(f'Validation accuracy: {float(accuracy):.2%}')
-      print(f'Digit accuracy: {float(digit_accuracy):.2%}, validation seconds: {time.monotonic() - start:.3f}', flush=True)
+      print(f'Digit accuracy: {float(digit_accuracy):.2%}, validation seconds: {validation_seconds:.3f}', flush=True)
+      # Same line as transformer.py; compilation is included in the first chunk of each shape, and
+      # "log" is the time spent writing the lines above.
+      print(f'Timing: train chunk {train_seconds:.2f} s, validation {validation_seconds:.2f} s, '
+            f'log {time.monotonic() - log_start:.2f} s, elapsed {time.monotonic() - run_start:.0f} s', flush=True)
       if step - last_save >= args.checkpoint_every:
         save_checkpoint(hparams['checkpoint_dir'], step, *carry, hparams)
         last_save = step

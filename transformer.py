@@ -1,6 +1,7 @@
 import argparse
 import os
 import pickle
+import time
 from functools import partial
 
 import flax.linen as nn
@@ -490,17 +491,26 @@ def model_outputs(transformer, params, sequence: jnp.ndarray, train: bool = Fals
 
 
 def generate_tokens(transformer, params, prompts: jnp.ndarray, n_tokens: int):
-  """Greedily decodes n_tokens continuations for each (unbatched-model) row in prompts."""
+  """Greedily decodes n_tokens continuations for each (unbatched-model) row in prompts.
+
+  As in generate_thoughts, tokens are written into a zero-padded sequence inside scan, so the
+  model is compiled once rather than once per prefix length (a Python loop over growing prefixes
+  made compiling validate take ~1000 s). Causal attention keeps the padding from affecting the
+  logits at each decoded position.
+  """
 
   apply_single = lambda seq: model_logits(transformer, params, seq, train=False)
+  batch_size, prompt_length = prompts.shape
+  padding = jnp.zeros((batch_size, n_tokens), dtype=prompts.dtype)
+  sequences = jnp.concatenate((prompts, padding), axis=-1)
 
-  sequences = prompts
-  for _ in range(n_tokens):
+  def step(sequences, offset):
     logits = jax.vmap(apply_single)(sequences)
-    next_tokens = jnp.argmax(logits[:, -1, :], axis=-1)
-    sequences = jnp.concatenate((sequences, next_tokens[:, None]), axis=-1)
+    next_tokens = jnp.argmax(logits[:, prompt_length + offset - 1, :], axis=-1)
+    return sequences.at[:, prompt_length + offset].set(next_tokens.astype(sequences.dtype)), None
 
-  return sequences[:, prompts.shape[1]:]
+  sequences, _ = jax.lax.scan(step, sequences, jnp.arange(n_tokens))
+  return sequences[:, prompt_length:]
 
 
 def generate_thoughts(transformer, params, prompts, task, n_thought_tokens, rng_key=None):
@@ -533,7 +543,9 @@ def generate_thoughts(transformer, params, prompts, task, n_thought_tokens, rng_
   return sequence
 
 
-def save_checkpoint(checkpoint_dir: str, step: int, params, opt_state, hparams: dict):
+def save_checkpoint(checkpoint_dir: str, step: int, params, opt_state, hparams: dict, curriculum=None):
+  """`curriculum` is the adaptive curriculum's position ({'stage', 'stage_steps', 'passes'}), so a
+  resumed run continues in the stage it was in; fixed schedules recover theirs from the step."""
   os.makedirs(checkpoint_dir, exist_ok=True)
   checkpoint_path = os.path.join(checkpoint_dir, f"{step}.pkl")
   with open(checkpoint_path, 'wb') as f:
@@ -542,6 +554,7 @@ def save_checkpoint(checkpoint_dir: str, step: int, params, opt_state, hparams: 
       'params': params,
       'opt_state': opt_state,
       'hparams': hparams,
+      'curriculum': curriculum,
     }, f)
 
 
@@ -576,7 +589,7 @@ def parse_num_length_schedule(schedule_args, default_length1: int, default_lengt
   return schedule
 
 
-def parse_args():
+def parse_args(argv=None):
   parser = argparse.ArgumentParser(description="Train a tiny transformer on integer arithmetic.")
   parser.add_argument('--model-type', choices=['transformer', 'memory'], default='transformer',
                        help="'memory' repeatedly processes the same token sequence with an explicit "
@@ -704,9 +717,23 @@ def parse_args():
                             "left over after the schedule (--num-steps minus the sum of ITERS) draw from "
                             "1..--sequence-length for both operands. The default reproduces the 777-parameter "
                             "reference's phases: (1,3) x 2000, (1,6) x 5000, (1,10) x the rest.")
-  parser.add_argument('--lr-schedule', type=str, default='cosine', choices=['cosine', 'constant'],
+  parser.add_argument('--lr-schedule', type=str, default='cosine',
+                       choices=['cosine', 'constant', 'warmup-constant', 'stage-cosine'],
                        help="Learning rate schedule. 'cosine' decays --learning-rate to --lr-min "
-                            "over the whole run (after any warmup).")
+                            "over the whole run (after any warmup); 'constant' holds --learning-rate "
+                            "from the first step; 'warmup-constant' warms up over --warmup-steps and then "
+                            "holds it (for --advance-at, whose run length is not known in advance); "
+                            "'stage-cosine' restarts at every --num-length-schedule stage: warmup over "
+                            "--warmup-steps, then cosine to --lr-min over the stage's ITERS (its maximum "
+                            "length under --advance-at). AdamW only.")
+  parser.add_argument('--advance-at', type=float, default=None,
+                       help="Adaptive curriculum: each --num-length-schedule stage's ITERS become its maximum "
+                            "length, and the run moves to the next stage as soon as the stage's validation "
+                            "accuracy (exactly N1 x N2-digit operands; full width for the last size) is at least "
+                            "this fraction for --advance-patience consecutive validations. A stage that uses "
+                            "up its ITERS without that ends the run (the frontier). Off by default.")
+  parser.add_argument('--advance-patience', type=int, default=2,
+                       help="Consecutive validations at or above --advance-at needed to advance.")
   parser.add_argument('--warmup-steps', type=int, default=1000,
                        help="Linear warmup from 0 to --learning-rate over this many steps, before the cosine decay.")
   parser.add_argument('--lr-min', type=float, default=2e-3,
@@ -724,7 +751,7 @@ def parse_args():
                        help="Number of training steps fused into a single jitted lax.scan call. Larger values "
                             "amortize per-step dispatch/kernel-launch overhead (which dominates at this model "
                             "size on GPU) but coarsen the logging/validation granularity to this many steps.")
-  return parser.parse_args() 
+  return parser.parse_args(argv)
 
 def make_train_step(transformer, task, optimizer, sequence_length1, sequence_length2,
                     batch_size, reverse_operands=False, early_eos=False, cot_steps=0,
@@ -734,8 +761,9 @@ def make_train_step(transformer, task, optimizer, sequence_length1, sequence_len
                     mtp_weight=1.0, return_aux_loss=False):
   """Shared trainer/profiler step; optional losses also supervise CoT answer positions.
 
-  The default keeps the profiler's (loss, grad_norm) metrics and four-argument step API.
-  Trainers can request a third auxiliary-loss metric and pass a curriculum digit cap.
+  The default returns (loss, grad_norm) metrics; the trainer requests a third auxiliary-loss
+  metric and passes a curriculum digit cap. The returned step also exposes its stages as
+  step.make_batch(params, key, n1, n2, max_digit) and step.loss_fn(params, batch, aux_targets).
   """
   if cot_steps < 0 or (cot_steps and cot_samples < 2):
     raise ValueError('CoT requires nonnegative steps and at least two samples')
@@ -753,8 +781,8 @@ def make_train_step(transformer, task, optimizer, sequence_length1, sequence_len
   make_prompts = jax.named_call(generate_prompts, name="data_generation")
   sample_thoughts = jax.named_call(generate_thoughts, name="thought_generation")
 
-  def train_step(opt, rng_key, num_length1, num_length2, max_digit=9):
-    params, state = opt
+  def make_batch(params, rng_key, num_length1, num_length2, max_digit=9):
+    """One step's training sequences (thoughts sampled from params under CoT) and aux targets."""
     if cot_steps:
       data_key, thought_key = jax.random.split(rng_key)
     else:
@@ -776,63 +804,66 @@ def make_train_step(transformer, task, optimizer, sequence_length1, sequence_len
       thought_prefix = sample_thoughts(transformer, params, prompts, task, cot_steps, thought_key)
       answer_marker = jnp.full((batch_size * cot_samples, 1), task.answer_token)
       prompts = jnp.concatenate((thought_prefix, answer_marker), axis=-1)
-    batch = jnp.concatenate((prompts, answer_tokens), axis=-1)
+    return jnp.concatenate((prompts, answer_tokens), axis=-1), aux_targets
 
-    def loss_fn(params, sequences, aux_targets):
-      def answer_loss(logits, sequence, ahead=1):
-        targets = sequence[answer_start + ahead:]
-        if targets.shape[0] == 0:
-          return jnp.zeros(())
-        loss = optax.softmax_cross_entropy_with_integer_labels(
-          logits[answer_start:sequence.shape[0] - ahead], targets)
+  def loss_fn(params, sequences, aux_targets):
+    def answer_loss(logits, sequence, ahead=1):
+      targets = sequence[answer_start + ahead:]
+      if targets.shape[0] == 0:
+        return jnp.zeros(())
+      loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits[answer_start:sequence.shape[0] - ahead], targets)
+      if early_eos:
+        # Compute the mask before shifting: an ahead target may start after EOS.
+        mask = answer_token_mask(sequence[answer_start + 1:], task.eos_token)[ahead - 1:]
+        return (loss * mask).sum() / jnp.maximum(mask.sum(), 1)
+      return loss.mean()
+
+    def loss_fn_single(sequence, aux_values):
+      logits, pass_logits, aux, mtp = model_outputs(transformer, params, sequence, train=True)
+      loss = answer_loss(logits, sequence)
+      train_loss = (jax.vmap(answer_loss, in_axes=(0, None))(pass_logits, sequence).mean()
+                    if deep_supervision else loss)
+      if transformer.mtp_tokens > 1:
+        train_loss += mtp_weight * sum(
+          answer_loss(mtp[ahead - 2], sequence, ahead)
+          for ahead in range(2, transformer.mtp_tokens + 1))
+      aux_loss = jnp.zeros(())
+      if aux_loss_weight > 0:
+        prediction = aux[aux_readout, answer_start:answer_start + aux_values.shape[0]]
+        if aux_loss_type == 'ce':
+          errors = optax.softmax_cross_entropy_with_integer_labels(prediction, aux_values)
+        else:
+          errors = (prediction[:, 0] - aux_values / aux_scale) ** 2
         if early_eos:
-          # Compute the mask before shifting: an ahead target may start after EOS.
-          mask = answer_token_mask(sequence[answer_start + 1:], task.eos_token)[ahead - 1:]
-          return (loss * mask).sum() / jnp.maximum(mask.sum(), 1)
-        return loss.mean()
-
-      def loss_fn_single(sequence, aux_values):
-        logits, pass_logits, aux, mtp = model_outputs(transformer, params, sequence, train=True)
-        loss = answer_loss(logits, sequence)
-        train_loss = (jax.vmap(answer_loss, in_axes=(0, None))(pass_logits, sequence).mean()
-                      if deep_supervision else loss)
-        if transformer.mtp_tokens > 1:
-          train_loss += mtp_weight * sum(
-            answer_loss(mtp[ahead - 2], sequence, ahead)
-            for ahead in range(2, transformer.mtp_tokens + 1))
-        aux_loss = jnp.zeros(())
-        if aux_loss_weight > 0:
-          prediction = aux[aux_readout, answer_start:answer_start + aux_values.shape[0]]
-          if aux_loss_type == 'ce':
-            errors = optax.softmax_cross_entropy_with_integer_labels(prediction, aux_values)
-          else:
-            errors = (prediction[:, 0] - aux_values / aux_scale) ** 2
-          if early_eos:
-            mask = answer_token_mask(sequence[answer_start + 1:], task.eos_token)[:aux_values.shape[0]]
-            aux_loss = (errors * mask).sum() / jnp.maximum(mask.sum(), 1)
-          else:
-            aux_loss = errors.mean()
-        thought_logprob = jnp.zeros(())
-        if cot_steps:
-          thought_logprobs = jax.nn.log_softmax(
-            logits[thought_start - 1:thought_start + cot_steps - 1, :10], axis=-1)
-          thought_tokens = sequence[thought_start:thought_start + cot_steps]
-          thought_logprob = jnp.take_along_axis(
-            thought_logprobs, thought_tokens[:, None], axis=-1).sum()
-        return train_loss + aux_loss_weight * aux_loss, (loss, aux_loss, thought_logprob)
-
-      total, (losses, aux_losses, thought_logprobs) = jax.vmap(loss_fn_single)(sequences, aux_targets)
-      policy_loss = jnp.zeros(())
+          mask = answer_token_mask(sequence[answer_start + 1:], task.eos_token)[:aux_values.shape[0]]
+          aux_loss = (errors * mask).sum() / jnp.maximum(mask.sum(), 1)
+        else:
+          aux_loss = errors.mean()
+      thought_logprob = jnp.zeros(())
       if cot_steps:
-        grouped_losses = losses.reshape(batch_size, cot_samples)
-        # Center first so identical answer losses yield an exactly zero advantage.
-        centered = grouped_losses - grouped_losses[:, :1]
-        other_mean = (centered.sum(axis=1, keepdims=True) - centered) / (cot_samples - 1)
-        advantage = jax.lax.stop_gradient(other_mean - centered).reshape(-1)
-        policy_loss = -(advantage * thought_logprobs).mean()
-      policy_term = cot_pg_weight * policy_loss
-      return total.mean() + policy_term, (losses.mean() + policy_term, aux_losses.mean())
+        thought_logprobs = jax.nn.log_softmax(
+          logits[thought_start - 1:thought_start + cot_steps - 1, :10], axis=-1)
+        thought_tokens = sequence[thought_start:thought_start + cot_steps]
+        thought_logprob = jnp.take_along_axis(
+          thought_logprobs, thought_tokens[:, None], axis=-1).sum()
+      return train_loss + aux_loss_weight * aux_loss, (loss, aux_loss, thought_logprob)
 
+    total, (losses, aux_losses, thought_logprobs) = jax.vmap(loss_fn_single)(sequences, aux_targets)
+    policy_loss = jnp.zeros(())
+    if cot_steps:
+      grouped_losses = losses.reshape(batch_size, cot_samples)
+      # Center first so identical answer losses yield an exactly zero advantage.
+      centered = grouped_losses - grouped_losses[:, :1]
+      other_mean = (centered.sum(axis=1, keepdims=True) - centered) / (cot_samples - 1)
+      advantage = jax.lax.stop_gradient(other_mean - centered).reshape(-1)
+      policy_loss = -(advantage * thought_logprobs).mean()
+    policy_term = cot_pg_weight * policy_loss
+    return total.mean() + policy_term, (losses.mean() + policy_term, aux_losses.mean())
+
+  def train_step(opt, rng_key, num_length1, num_length2, max_digit=9):
+    params, state = opt
+    batch, aux_targets = make_batch(params, rng_key, num_length1, num_length2, max_digit)
     with jax.named_scope("loss_and_gradients"):
       (_, (loss, aux_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch, aux_targets)
     grad_norm = optax.global_norm(grads)
@@ -842,11 +873,16 @@ def make_train_step(transformer, task, optimizer, sequence_length1, sequence_len
     metrics = (loss, grad_norm, aux_loss) if return_aux_loss else (loss, grad_norm)
     return (params, state), metrics
 
-  return jax.named_call(train_step, name="train_step")
+  step = jax.named_call(train_step, name="train_step")
+  # The step's stages, which profile_algorithms.py times separately.
+  step.make_batch, step.loss_fn = make_batch, loss_fn
+  return step
 
 
-def main():
-  args = parse_args()
+def build_training(args):
+  """Everything main() trains with, built from parsed arguments: the model, initial (or resumed)
+  optimizer state, the jitted train_chunk and validate, and the curriculum. Shared with
+  profile_algorithms.py so that profiling measures exactly what training runs."""
   if args.cot_steps < 0 or (args.cot_steps and args.cot_samples < 2):
     raise ValueError("--cot-steps must be nonnegative, and CoT requires --cot-samples >= 2")
   if args.cot_pg_weight < 0:
@@ -910,8 +946,6 @@ def main():
   # overshoot --num-steps), so the LR decays over that horizon, not over --num-steps.
   total_steps = sum(iters for _, _, iters, _ in num_length_schedule)
   num_samples = args.num_samples
-  checkpoint_dir = args.checkpoint_dir
-  checkpoint_every = args.checkpoint_every
   steps_per_chunk = max(1, args.steps_per_chunk)
 
   hparams = {
@@ -968,6 +1002,8 @@ def main():
     'digit_pos_embed': args.digit_pos_embed,
     'muon_lr_mult': args.muon_lr_mult,
     'init_params': args.init_params,
+    'advance_at': args.advance_at,
+    'advance_patience': args.advance_patience,
   }
   if args.mtp_tokens < 1:
     raise ValueError(f"--mtp-tokens must be at least 1, got {args.mtp_tokens}")
@@ -993,7 +1029,7 @@ def main():
     params = transformer.init(init_key, example_sequence, train=False)
 
   n_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
-  print(f"Trainable parameters: {n_params:,}")
+  print(f"Trainable parameters: {n_params:,}", flush=True)
 
   # Decay over the whole run, i.e. across every num_length stage rather than restarting per stage.
   # optax threads the step count through the optimizer state, so this works unchanged inside
@@ -1019,10 +1055,34 @@ def main():
         decay_steps=total_steps,
         alpha=lr_min / learning_rate if learning_rate > 0 else 0.0,
       )
+  elif lr_schedule_name == 'warmup-constant' and warmup_steps > 0:
+    lr_schedule = optax.join_schedules(
+      [optax.linear_schedule(0.0, learning_rate, warmup_steps), optax.constant_schedule(learning_rate)],
+      [warmup_steps])
   else:
     lr_schedule = optax.constant_schedule(learning_rate)
 
-  if optimizer_name == 'muon' and args.muon_lr_mult != 1.0:
+  stage_lr = None
+  if lr_schedule_name == 'stage-cosine':
+    if optimizer_name != 'adamw':
+      raise ValueError("--lr-schedule stage-cosine supports only --optimizer adamw")
+
+    def stage_lr(stage_step, stage_iters):
+      """LR for the step after `stage_step` steps of a stage that lasts at most `stage_iters`."""
+      stage_step = jnp.asarray(stage_step, jnp.float32)
+      warmup = jnp.minimum(warmup_steps, stage_iters - 1)
+      progress = jnp.clip((stage_step - warmup) / jnp.maximum(stage_iters - warmup, 1), 0.0, 1.0)
+      cosine = lr_min + 0.5 * (learning_rate - lr_min) * (1 + jnp.cos(jnp.pi * progress))
+      return jnp.where(stage_step < warmup, learning_rate * stage_step / jnp.maximum(warmup, 1), cosine)
+
+  if stage_lr is not None:
+    # The LR is a hyperparameter in the optimizer state, which train_chunk sets before every step
+    # from the position inside the current stage (the optimizer's own count is global).
+    optimizer = optax.inject_hyperparams(
+      lambda learning_rate: optax.chain(
+        *([optax.clip_by_global_norm(grad_clip_norm)] if grad_clip_norm > 0 else []),
+        optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay)))(learning_rate=learning_rate)
+  elif optimizer_name == 'muon' and args.muon_lr_mult != 1.0:
     # Muon for the hidden matrices at muon_lr_mult times the schedule; AdamW, at the schedule
     # itself, for everything else including the (tied) embedding tables.
     muon_lr_mult = args.muon_lr_mult
@@ -1036,7 +1096,7 @@ def main():
     optimizer = optax.contrib.muon(learning_rate=lr_schedule, weight_decay=weight_decay)
   else:
     optimizer = optax.adamw(learning_rate=lr_schedule, weight_decay=weight_decay)
-  if grad_clip_norm > 0:
+  if grad_clip_norm > 0 and stage_lr is None:
     optimizer = optax.chain(optax.clip_by_global_norm(grad_clip_norm), optimizer)
   state = optimizer.init(params)
 
@@ -1049,13 +1109,19 @@ def main():
     state = optimizer.init(params)
     print(f"Initialised parameters from {args.init_params}", flush=True)
 
+  if args.advance_at is not None and (not 0 < args.advance_at <= 1 or args.advance_patience < 1):
+    raise ValueError("--advance-at must be in (0, 1] and --advance-patience at least 1")
   start_step = 0
+  resume_curriculum = None
   if args.resume is not None:
     with open(args.resume, 'rb') as f:
       checkpoint = pickle.load(f)
     if jax.tree_util.tree_structure(checkpoint['params']) != jax.tree_util.tree_structure(params):
       raise ValueError(f"{args.resume} has different parameters than the model these arguments build")
     params, state, start_step = checkpoint['params'], checkpoint['opt_state'], checkpoint['step']
+    resume_curriculum = checkpoint.get('curriculum')
+    if args.advance_at is not None and resume_curriculum is None:
+      raise ValueError(f"{args.resume} has no adaptive-curriculum position to resume --advance-at from")
     # Fresh data after the resume point rather than a replay of the first steps' batches.
     rng_key = jax.random.fold_in(rng_key, start_step)
     print(f"Resumed from {args.resume} at step {start_step}", flush=True)
@@ -1070,14 +1136,24 @@ def main():
     mtp_weight=args.mtp_weight, return_aux_loss=True)
 
   @partial(jax.jit, static_argnames=('num_length1', 'num_length2', 'max_digit', 'n_steps'), donate_argnums=(0,))
-  def train_chunk(opt, rng_key, num_length1, num_length2, max_digit, n_steps):
+  def train_chunk(opt, rng_key, num_length1, num_length2, max_digit, n_steps, stage_step=0, stage_iters=1):
     """Runs n_steps training steps inside one jitted lax.scan. At this model size the per-step
     kernels are tiny, so fusing steps keeps the accelerator from being dispatch-bound; donating
-    `opt` lets XLA update the params/optimizer buffers in place."""
+    `opt` lets XLA update the params/optimizer buffers in place. `stage_step` (steps already done
+    in the current stage) and `stage_iters` set the LR under --lr-schedule stage-cosine."""
+
+    def step(o, k_and_t):
+      k, t = k_and_t
+      if stage_lr is not None:
+        params, state = o
+        hyperparams = dict(state.hyperparams, learning_rate=stage_lr(t, stage_iters).astype(
+          state.hyperparams['learning_rate'].dtype))
+        o = (params, state._replace(hyperparams=hyperparams))
+      return train_step(o, k, num_length1, num_length2, max_digit)
 
     step_keys = jax.random.split(rng_key, n_steps)
     opt, (losses, grad_norms, aux_losses) = jax.lax.scan(
-      lambda o, k: train_step(o, k, num_length1, num_length2, max_digit), opt, step_keys)
+      step, opt, (step_keys, stage_step + jnp.arange(n_steps)))
     return opt, losses.mean(), grad_norms.mean(), aux_losses.mean()
 
   @partial(jax.jit, static_argnames=('num_length1', 'num_length2'))
@@ -1129,47 +1205,110 @@ def main():
       'predicted_answer': digits_to_int(predicted_digits),
     }
 
-  opt = (params, state)
+  return argparse.Namespace(
+    task=task, hparams=hparams, transformer=transformer, optimizer=optimizer,
+    lr_schedule=lr_schedule, stage_lr=stage_lr, train_step=train_step, train_chunk=train_chunk, validate=validate,
+    opt=(params, state), rng_key=rng_key, start_step=start_step, resume_curriculum=resume_curriculum,
+    num_length_schedule=num_length_schedule, steps_per_chunk=steps_per_chunk,
+    sequence_length=(sequence_length1, sequence_length2))
+
+
+def main():
+  args = parse_args()
+  run = build_training(args)
+  opt, rng_key, train_chunk, validate = run.opt, run.rng_key, run.train_chunk, run.validate
+  start_step, steps_per_chunk, lr_schedule = run.start_step, run.steps_per_chunk, run.lr_schedule
+  sequence_length1, sequence_length2 = run.sequence_length
+  hparams, aux_loss_weight = run.hparams, args.aux_loss_weight
+  checkpoint_dir, checkpoint_every = args.checkpoint_dir, args.checkpoint_every
 
   i = start_step
   last_checkpoint_step = start_step
   stage_start = 0
-  for num_length1, num_length2, iters, max_digit in num_length_schedule:
-    # When resuming, skip the stages (and the part of the current stage) already trained.
-    steps_done = min(iters, max(0, start_step - stage_start))
-    stage_start += iters
-    if steps_done == iters:
+  run_start = time.monotonic()
+  # Adaptive curriculum (--advance-at): where the run is, saved with every checkpoint.
+  advance_at, patience = args.advance_at, args.advance_patience
+  curriculum = run.resume_curriculum or {'stage': 0, 'stage_steps': 0, 'passes': 0}
+  for stage, (num_length1, num_length2, iters, max_digit) in enumerate(run.num_length_schedule):
+    if advance_at is None:
+      # When resuming, skip the stages (and the part of the current stage) already trained.
+      steps_done = min(iters, max(0, start_step - stage_start))
+      stage_start += iters
+    elif stage < curriculum['stage']:
       continue
-    print(f"Training on num_length1={num_length1}, num_length2={num_length2} max_digit={max_digit} for {iters - steps_done} steps", flush=True)
+    else:
+      if stage > curriculum['stage']:
+        curriculum = {'stage': stage, 'stage_steps': 0, 'passes': 0}
+      steps_done = curriculum['stage_steps']
+    if steps_done == iters and advance_at is None:
+      continue
+    print(f"Training on num_length1={num_length1}, num_length2={num_length2} max_digit={max_digit} for "
+          f"{'up to ' if advance_at is not None else ''}{iters - steps_done} steps", flush=True)
     while steps_done < iters:
       # A stage whose length is not a multiple of steps_per_chunk ends with one shorter chunk,
       # which costs one extra compilation for that stage.
       n_steps = min(steps_per_chunk, iters - steps_done)
       rng_key, train_key = jax.random.split(rng_key)
-      opt, loss, grad_norm, aux_loss = train_chunk(opt, train_key, num_length1, num_length2, max_digit, n_steps)
+      chunk_start = time.monotonic()
+      opt, loss, grad_norm, aux_loss = train_chunk(
+        opt, train_key, num_length1, num_length2, max_digit, n_steps, steps_done, iters)
+      jax.block_until_ready(opt)
+      train_seconds = time.monotonic() - chunk_start
       steps_done += n_steps
       i += n_steps
 
+      validation_start = time.monotonic()
       rng_key, val_key = jax.random.split(rng_key)
       results = validate(opt[0], val_key)
-      print(f"Step {i}, Loss (mean over last {n_steps} steps): {loss}, Grad norm (mean over last {n_steps} steps, pre-clip): {grad_norm}, LR: {float(lr_schedule(i - 1)):.3e}")
-      if aux_loss_weight > 0:
-        print(f"Aux loss (mean over last {n_steps} steps): {float(aux_loss):.3e}")
-      print(f"Validation accuracy: {float(results['accuracy']) * 100:.2f}%", flush=True)
-      print("Digit accuracy (LSB first): "
-            + ' '.join(f'{float(x) * 100:.1f}' for x in results['digit_accuracy']), flush=True)
+      stage_results = None
       if (num_length1, num_length2) != (sequence_length1, sequence_length2):
         rng_key, stage_key = jax.random.split(rng_key)
         stage_results = validate(opt[0], stage_key, num_length1, num_length2)
+      jax.block_until_ready((results, stage_results))
+      validation_seconds = time.monotonic() - validation_start
+
+      log_start = time.monotonic()
+      lr = float(lr_schedule(i - 1) if run.stage_lr is None else run.stage_lr(steps_done - 1, iters))
+      print(f"Step {i}, Loss (mean over last {n_steps} steps): {loss}, Grad norm (mean over last {n_steps} steps, pre-clip): {grad_norm}, LR: {lr:.3e}", flush=True)
+      if aux_loss_weight > 0:
+        print(f"Aux loss (mean over last {n_steps} steps): {float(aux_loss):.3e}", flush=True)
+      print(f"Validation accuracy: {float(results['accuracy']) * 100:.2f}%", flush=True)
+      print("Digit accuracy (LSB first): "
+            + ' '.join(f'{float(x) * 100:.1f}' for x in results['digit_accuracy']), flush=True)
+      if stage_results is not None:
         print(f"Stage validation accuracy ({num_length1}x{num_length2} digits): "
               f"{float(stage_results['accuracy']) * 100:.2f}%", flush=True)
+      # Compilation is included in the first chunk of each shape and the first validations; "log"
+      # is the time spent writing the lines above.
+      print(f"Timing: train chunk {train_seconds:.2f} s, validation {validation_seconds:.2f} s, "
+            f"log {time.monotonic() - log_start:.2f} s, elapsed {time.monotonic() - run_start:.0f} s", flush=True)
 
-      if checkpoint_dir is not None and i - last_checkpoint_step >= checkpoint_every:
-        save_checkpoint(checkpoint_dir, i, opt[0], opt[1], hparams)
+      solved = False
+      if advance_at is not None:
+        stage_accuracy = float((results if stage_results is None else stage_results)['accuracy'])
+        passes = curriculum['passes'] + 1 if stage_accuracy >= advance_at else 0
+        curriculum = {'stage': stage, 'stage_steps': steps_done, 'passes': passes}
+        solved = passes >= patience
+        if solved:
+          print(f"Stage {num_length1}x{num_length2} solved at step {i} after {steps_done} stage steps "
+                f"({patience} validations >= {advance_at * 100:.1f}%)", flush=True)
+          curriculum = {'stage': stage + 1, 'stage_steps': 0, 'passes': 0}
+
+      if checkpoint_dir is not None and (solved or i - last_checkpoint_step >= checkpoint_every):
+        save_checkpoint(checkpoint_dir, i, opt[0], opt[1], hparams, curriculum)
         last_checkpoint_step = i
+      if solved:
+        break
+    else:
+      if advance_at is not None:
+        print(f"Curriculum stopped: {num_length1}x{num_length2} did not reach {advance_at * 100:.1f}% "
+              f"within {iters} stage steps (step {i})", flush=True)
+        break
 
-  if checkpoint_dir is not None:
-    save_checkpoint(checkpoint_dir, i, opt[0], opt[1], hparams)
+  if advance_at is not None and curriculum['stage'] >= len(run.num_length_schedule):
+    print("Curriculum finished: every stage solved", flush=True)
+  if checkpoint_dir is not None and i != last_checkpoint_step:
+    save_checkpoint(checkpoint_dir, i, opt[0], opt[1], hparams, curriculum)
 
 
 if __name__ == "__main__":
